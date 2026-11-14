@@ -1,0 +1,24 @@
+# Build output (build.bat / PyInstaller)
+build/
+dist/
+*.spec
+
+# Python
+.venv/
+venv/
+env/
+__pycache__/
+*.py[cod]
+*.pyo
+
+# Logs and local junk
+*.log
+*.tmp
+Thumbs.db
+desktop.ini
+.DS_Store
+
+# Editors
+.vscode/
+.idea/
+*.swp
