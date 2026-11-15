@@ -4,6 +4,18 @@ What changed in each version of Astra Optimizer. The newest version is at the to
 
 When a version is tagged on GitHub (for example `v1.2.0`), its section below becomes the release notes.
 
+## v1.7.0 - 2026-11-16
+
+### Added
+- **Benchmark mode:** press **Ctrl+Alt+K** while playing (or use the tray menu or the overlay's right-click menu)
+  for a fair FPS test. The overlay counts down 3 seconds, measures exactly 60 seconds of the game's own frames, then
+  shows the average and 1% low. Each run is saved to the game's history as "Benchmark · Max FPS" (or whichever mode
+  was applied), so **Compare** can put a run before a mode next to a run after it. Press Ctrl+Alt+K again to cancel;
+  closing the game cancels it too.
+
+### Changed
+- A game's history counts sessions and benchmarks separately, and its average FPS comes from real sessions only.
+
 ## v1.6.0 - 2026-11-16
 
 ### Added

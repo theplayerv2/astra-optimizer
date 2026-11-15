@@ -56,8 +56,8 @@ except Exception:  # pragma: no cover - depends on the build
 
 APP_NAME = "Astra Optimizer"
 LEGACY_APP_NAME = "Optimizer"  # pre-1.12 name: data folder and startup task are carried over
-APP_VERSION = "1.6.0"
-DISPLAY_VERSION = "v1.6.0"
+APP_VERSION = "1.7.0"
+DISPLAY_VERSION = "v1.7.0"
 CREDIT_NAME = "theplayerv2"
 UPDATE_REPO = "theplayerv2/astra-optimizer"
 CREDIT_URL = f"https://github.com/{UPDATE_REPO}"
@@ -2413,6 +2413,8 @@ HOTKEY_LABEL = "Ctrl+Alt+O"
 HOTKEY_VK = ord("O")
 OVERLAY_HOTKEY_LABEL = "Ctrl+Alt+F"
 OVERLAY_HOTKEY_VK = ord("F")
+BENCH_HOTKEY_LABEL = "Ctrl+Alt+K"
+BENCH_HOTKEY_VK = ord("K")
 AUTOSTART_TASK = "Astra Optimizer Autostart"
 LEGACY_AUTOSTART_TASK = "Optimizer Autostart"
 INSTANCE_EVENT = "Local\\AstraOptimizerShowWindow"
@@ -2878,6 +2880,8 @@ class TrayIcon:
             pystray.MenuItem("Mode", pystray.Menu(*modes)),
             pystray.MenuItem(f"Overlay ({OVERLAY_HOTKEY_LABEL})", send("overlay"),
                              checked=lambda item: app.overlay_visible()),
+            pystray.MenuItem(lambda item: "Cancel benchmark" if app.bench else f"Benchmark {BENCH_SECONDS} s ({BENCH_HOTKEY_LABEL})",
+                             send("bench"), enabled=lambda item: bool(app.bench or app.sessions_live)),
             pystray.MenuItem("Report a problem", send("report"), enabled=lambda item: not app.report_busy),
             pystray.Menu.SEPARATOR,
             pystray.MenuItem(f"Exit {APP_NAME}", send("exit")),
@@ -4463,6 +4467,9 @@ def merge_backup(current: dict, backup: dict) -> dict:
 # --------------------------------------------------------------------------------------
 
 SESSION_MIN_SECONDS = 60
+BENCH_SECONDS = 60     # a benchmark measures exactly this long...
+BENCH_COUNTDOWN = 3    # ...after this countdown on the overlay
+BENCH_RESULT_SECONDS = 10  # how long the result stays on the overlay
 SESSION_PING_HOST = "1.1.1.1"
 SESSION_KEEP = 100
 
@@ -4549,6 +4556,8 @@ class FrameCapture(threading.Thread):
         self.error: str | None = None
         self.proc: subprocess.Popen | None = None
         self._stopping = False
+        self.bench: FrameStats | None = None  # a benchmark's frames, while one runs
+        self.bench_key: tuple | None = None
 
     def run(self) -> None:
         import csv
@@ -4581,6 +4590,9 @@ class FrameCapture(threading.Thread):
                     self.recent[key] = deque(maxlen=2400)
                 stats.add(ms)
                 self.recent[key].append(ms)
+                bench = self.bench
+                if bench is not None and key == self.bench_key:
+                    bench.add(ms)
                 self.last_frame[key] = time.monotonic()
         except (OSError, ValueError):
             pass
@@ -4608,6 +4620,18 @@ class FrameCapture(threading.Thread):
         if not self.stats:
             return None
         return max(self.stats.values(), key=lambda st: st.count).summary()
+
+    def start_bench(self) -> bool:
+        """Start counting the game's frames on their own; False while it isn't drawing."""
+        if self.live() is None:
+            return False
+        self.bench_key = max(self.stats, key=lambda k: self.stats[k].count)
+        self.bench = FrameStats()
+        return True
+
+    def end_bench(self) -> dict | None:
+        bench, self.bench = self.bench, None
+        return bench.summary() if bench is not None else None
 
     def recent_frames(self, count: int) -> list[float]:
         """The busiest swap chain's last frame times (ms), oldest first; empty when it's gone quiet."""
@@ -4660,10 +4684,10 @@ def add_session_sample(session: dict, data: dict) -> None:
         session["temp_peak"] = max(session["temp_peak"] or 0, float(gpu["temp"]))
 
 
-def finish_session(session: dict, now: float | None = None) -> dict | None:
+def finish_session(session: dict, now: float | None = None, min_seconds: float = SESSION_MIN_SECONDS) -> dict | None:
     """The saved report, or None for a session too short (or too empty) to be worth one."""
     end = now or time.time()
-    if end - session["start"] < SESSION_MIN_SECONDS or not session["n"]:
+    if end - session["start"] < min_seconds or not session["n"]:
         return None
     report = {"exe": session["exe"], "name": session["name"], "start": session["start"], "end": end,
               **(session.get("fps") or {}),
@@ -4704,8 +4728,12 @@ def format_day(stamp: float, now: float | None = None) -> str:
 
 
 def session_report_text(report: dict) -> str:
-    lines = [f"Played for {format_duration(report['end'] - report['start'])}, "
-             f"{format_clock(report['start'])} to {format_clock(report['end'])}.", ""]
+    if report.get("benchmark"):
+        lines = [f"{BENCH_SECONDS}-second benchmark at {format_clock(report['start'])}, "
+                 f"with {report.get('label') or 'no mode'} applied.", ""]
+    else:
+        lines = [f"Played for {format_duration(report['end'] - report['start'])}, "
+                 f"{format_clock(report['start'])} to {format_clock(report['end'])}.", ""]
     if report.get("fps_avg") is not None:
         spikes = report.get("fps_spikes", 0)
         lines.append(f"FPS: {report['fps_avg']:.0f} average, {report['fps_low1']:.0f} 1% low, "
@@ -4732,6 +4760,12 @@ def session_report_text(report: dict) -> str:
     if notes:
         lines += [""] + notes
     return "\n".join(lines)
+
+
+def benchmark_summary(report: dict) -> str:
+    if report.get("fps_avg") is None:
+        return "no FPS measured"
+    return f"{report['fps_avg']:.0f} FPS average, {report['fps_low1']:.0f} 1% low"
 
 
 def session_summary(report: dict) -> str:
@@ -5723,6 +5757,9 @@ class OverlayRenderer:
         """(kind, value, unit, slot text, warn) in display order; 'graph' is its own kind."""
         st, out = self.style, []
         fps, low = d.get("fps"), d.get("low")
+        banner = d.get("banner")  # (text, widest text it will show, highlight) during a benchmark
+        if banner:
+            out.append(("text", banner[0], "", banner[1], bool(banner[2])))
         out.append(("pair", "–" if fps is None else f"{fps:.0f}", "fps", "000", False))
         if st["graph"]:
             out.append(("graph", None, None, None, False))
@@ -5774,8 +5811,8 @@ class OverlayRenderer:
                 self._graph(text, x, (h - self.graph_h) // 2, d.get("frames") or [])
             else:
                 colour = hex_rgb(WARN_YELLOW) + (255,) if warn else (255, 255, 255, 255)
-                draw.text((x + slot_w - self._w(self.f_value, value), baseline), value, font=self.f_value,
-                          fill=colour, anchor="ls")
+                left = x if kind == "text" else x + slot_w - self._w(self.f_value, value)  # banners read left to right
+                draw.text((left, baseline), value, font=self.f_value, fill=colour, anchor="ls")
                 if unit:
                     draw.text((x + slot_w + self.unit_gap, baseline), unit, font=self.f_unit,
                               fill=(255, 255, 255, 140), anchor="ls")
@@ -5875,6 +5912,9 @@ class OverlayWindow:
             self._vars.append(var)
             menu.add_checkbutton(label=label, variable=var, command=lambda k=key, v=var: self.set_style(k, v.get()))
         menu.add_separator()
+        menu.add_command(label=(f"Cancel benchmark  ({BENCH_HOTKEY_LABEL})" if self.app.bench
+                                else f"Benchmark {BENCH_SECONDS} s  ({BENCH_HOTKEY_LABEL})"),
+                         command=self.app._toggle_benchmark)
         menu.add_command(label=f"Hide overlay  ({OVERLAY_HOTKEY_LABEL})", command=lambda: self.app._toggle_overlay(False))
         # Windows only closes a popup menu on a click outside it while the menu's window is in the
         # foreground, and the overlay normally never is (it doesn't take focus). So it may take focus
@@ -6075,6 +6115,9 @@ class OptimizerApp(ctk.CTk):
         self.tray: TrayIcon | None = None
         self.hotkey: HotkeyThread | None = None
         self.overlay_hotkey: HotkeyThread | None = None
+        self.bench_hotkey: HotkeyThread | None = None
+        self.bench: dict | None = None  # the benchmark in progress
+        self._bench_result: tuple[str, float] | None = None  # (overlay text, monotonic time it goes)
         self.overlay: OverlayWindow | None = None
         self._overlay_auto = False   # shown because a game started (hidden again when it ends)
         self._last_tel: dict = {}
@@ -8541,10 +8584,14 @@ class OptimizerApp(ctk.CTk):
                 elif kind == "session-ping":
                     if event[1] is not None:
                         self._last_ping = event[1]
+                    if self.bench and self.bench["phase"] == "running":
+                        self.bench["acc"]["pings"].append(event[1])
                     for session in self.sessions_live.values():
                         session["pings"].append(event[1])
                 elif kind == "overlay-hotkey":
                     self._toggle_overlay()
+                elif kind == "bench-hotkey":
+                    self._toggle_benchmark()
                 elif kind == "game-start":
                     self._on_game_start(*event[1:])
                 elif kind == "game-stop":
@@ -8704,7 +8751,122 @@ class OptimizerApp(ctk.CTk):
         gpu = self._last_tel.get("gpu") or {}
         return {"fps": live[0] if live else None, "low": live[1] if live else None, "frames": frames,
                 "gpu_temp": gpu.get("temp"), "gpu_load": gpu.get("load"), "cpu": self._last_tel.get("cpu"),
-                "ping": self._last_ping if self.sessions_live else None}
+                "ping": self._last_ping if self.sessions_live else None, "banner": self._bench_banner()}
+
+    # ---------------- benchmark: a fixed 60 s FPS capture, saved to the game's history ----------------
+
+    def _bench_banner(self) -> tuple[str, str, bool] | None:
+        now = time.monotonic()
+        bench = self.bench
+        if bench is not None:
+            left = max(0, math.ceil(bench["until"] - now))
+            if bench["phase"] == "countdown":
+                return f"Benchmark in {left}", "Benchmark in 0", True
+            return f"Benchmark {left} s", "Benchmark 00 s", False
+        if self._bench_result and now < self._bench_result[1]:
+            return self._bench_result[0], self._bench_result[0], False
+        return None
+
+    def _bench_mode_label(self) -> str:
+        applied = self.state_store.get("applied_profile") if self.undo_count else None
+        return PROFILE_TITLES.get(applied, "No mode")
+
+    def _toggle_benchmark(self) -> None:
+        if self.bench is not None:
+            self._end_benchmark(f"Benchmark of {self.bench['name']} cancelled")
+            return
+        playing = [(exe, s) for exe, s in self.sessions_live.items() if s.get("capture") is not None]
+        drawing = [(exe, s) for exe, s in playing if s["capture"].live() is not None]
+        if not drawing:
+            if not self.sessions_live:
+                why = "Start one of your games first, then press it in the game."
+            elif not playing:
+                why = ("FPS can't be measured here (it needs administrator rights)." if not self.admin
+                       else "FPS isn't being measured for this game.")
+            else:
+                why = "The game isn't drawing frames right now (loading, paused or minimized)."
+            self._emit("warn", f"No benchmark: {why}")
+            self._notify("No benchmark", why)
+            return
+        exe, session = drawing[-1]
+        self._bench_result = None
+        opened = not self.overlay_visible()
+        if opened:
+            self._toggle_overlay(True, auto=True)
+        self.bench = {"exe": exe, "name": session["name"], "phase": "countdown", "label": self._bench_mode_label(),
+                      "until": time.monotonic() + BENCH_COUNTDOWN, "opened_overlay": opened}
+        self._emit("info", f"Benchmark of {session['name']} starts in {BENCH_COUNTDOWN} s and runs for {BENCH_SECONDS} s "
+                           f"with {self.bench['label']} applied. Play normally; {BENCH_HOTKEY_LABEL} cancels it.")
+        self._tray_refresh()
+        self.after(100, self._bench_tick)
+
+    def _bench_tick(self) -> None:
+        bench = self.bench
+        if bench is None or self._closing:
+            return
+        session = self.sessions_live.get(bench["exe"])
+        capture = session.get("capture") if session else None
+        if capture is None:
+            self._end_benchmark(f"Benchmark of {bench['name']} stopped: the game closed")
+            return
+        now = time.monotonic()
+        if bench["phase"] == "countdown" and now >= bench["until"]:
+            if not capture.start_bench():
+                self._end_benchmark(f"Benchmark of {bench['name']} stopped: the game isn't drawing frames")
+                return
+            bench.update(phase="running", until=now + BENCH_SECONDS,
+                         acc=new_session(bench["exe"], bench["name"]))
+        elif bench["phase"] == "running" and now >= bench["until"]:
+            self._finish_benchmark(bench, capture)
+            return
+        self.after(200, self._bench_tick)
+
+    def _finish_benchmark(self, bench: dict, capture: FrameCapture) -> None:
+        acc = bench["acc"]
+        acc["fps"] = capture.end_bench()
+        if not acc["n"] and self._last_tel:
+            add_session_sample(acc, self._last_tel)
+        report = finish_session(acc, acc["start"] + BENCH_SECONDS, min_seconds=0)
+        self.bench = None
+        if report is None or report.get("fps_avg") is None:
+            self._end_benchmark(f"Benchmark of {bench['name']} found too few frames to measure", bench)
+            return
+        report.update(benchmark=True, label=bench["label"])
+        saved = list(self._setting("sessions") or [])
+        saved.append(report)
+        self._set_setting("sessions", saved[-SESSION_KEEP:])
+        self._bench_result = (f"{report['fps_avg']:.0f} avg · {report['fps_low1']:.0f} low",
+                              time.monotonic() + BENCH_RESULT_SECONDS)
+        self._emit("ok", f"Benchmark of {bench['name']} ({bench['label']}): {benchmark_summary(report)}. "
+                         f"Compare it with another run in Tools → Games → {bench['name']}")
+        self._after_benchmark(bench)
+        self._paint_games()
+        self._render()
+
+    def _end_benchmark(self, message: str, bench: dict | None = None) -> None:
+        bench = bench or self.bench
+        self.bench = None
+        if bench is not None:
+            session = self.sessions_live.get(bench["exe"])
+            if session and session.get("capture") is not None:
+                session["capture"].end_bench()
+        self._bench_result = None
+        self._emit("warn", message)
+        self._after_benchmark(bench)
+
+    def _after_benchmark(self, bench: dict | None) -> None:
+        self._tray_refresh()
+        if self.overlay_visible():
+            self.overlay.update(self._overlay_data())
+        if bench and bench.get("opened_overlay"):
+            wait = BENCH_RESULT_SECONDS * 1000 if self._bench_result else 0
+            self.after(wait, self._hide_bench_overlay)
+
+    def _hide_bench_overlay(self) -> None:
+        # Only the overlay this benchmark opened, and only while nothing else wants it shown.
+        if self.bench is None and self._overlay_auto and self.overlay_visible() \
+                and not (self.sessions_live and self._setting("overlay")):
+            self._toggle_overlay(False)
 
     def _overlay_tick(self) -> None:
         if self._closing or not self.overlay_visible():
@@ -8720,6 +8882,14 @@ class OptimizerApp(ctk.CTk):
             self.overlay_hotkey = hotkey
         else:
             self._emit("warn", f"{OVERLAY_HOTKEY_LABEL} is already taken by another app; use the tray menu for the overlay")
+        bench = HotkeyThread(self.events, 3, BENCH_HOTKEY_VK, "bench-hotkey")
+        bench.start()
+        bench.ready.wait(2.0)
+        if bench.ok:
+            self.bench_hotkey = bench
+        else:
+            self._emit("warn", f"{BENCH_HOTKEY_LABEL} is already taken by another app; "
+                               "start benchmarks from the tray menu or the overlay's right-click menu")
 
     def _start_hotkey(self) -> bool:
         if self.hotkey is not None:
@@ -8788,6 +8958,8 @@ class OptimizerApp(ctk.CTk):
             self._quit()
         elif action == "overlay":
             self._toggle_overlay()
+        elif action == "bench":
+            self._toggle_benchmark()
         elif action == "report":
             self._show_window()
             self._report_problem()
@@ -9664,6 +9836,8 @@ class OptimizerApp(ctk.CTk):
             self.session_pinger.start()
 
     def _end_session(self, exe: str) -> None:
+        if self.bench and self.bench["exe"] == exe:
+            self._end_benchmark(f"Benchmark of {self.bench['name']} stopped: the game closed")
         session = self.sessions_live.pop(exe, None)
         if not self.sessions_live and self.session_pinger is not None:
             self.session_pinger.stop_event.set()
@@ -9700,7 +9874,8 @@ class OptimizerApp(ctk.CTk):
         return None
 
     def _show_session_report(self, report: dict) -> None:
-        self._open_dialog(f"{report['name']} session", session_report_text(report), "Done", lambda: None,
+        kind = "benchmark" if report.get("benchmark") else "session"
+        self._open_dialog(f"{report['name']} {kind}", session_report_text(report), "Done", lambda: None,
                           cancel_label=None, width=460)
 
     def _window_visible(self) -> bool:
@@ -9739,7 +9914,12 @@ class OptimizerApp(ctk.CTk):
         name = self._game_name(os.path.normcase(path))
         c.itemconfigure(self.t_buttons["findgames"], text="Back")
         c.itemconfigure(self.t_buttons["addgame"], text="Cancel" if self.compare_pick is not None else "Compare")
-        c.itemconfigure(self.t_game_heads["name"], text=self._fit(f"{name.upper()}  ·  {len(sessions)} SESSIONS",
+        benches = sum(1 for r in sessions if r.get("benchmark"))
+        played = len(sessions) - benches
+        counts = [f"{played} SESSION{'S' if played != 1 else ''}"] if played or not benches else []
+        if benches:
+            counts.append(f"{benches} BENCHMARK{'S' if benches != 1 else ''}")
+        c.itemconfigure(self.t_game_heads["name"], text=self._fit(f"{name.upper()}  ·  {'  ·  '.join(counts)}",
                                                                   self.f_label, 280))
         for col in ("prio", "fso"):
             c.itemconfigure(self.t_game_heads[col], text="")
@@ -9756,7 +9936,9 @@ class OptimizerApp(ctk.CTk):
             when = format_day(r["end"])
             c.itemconfigure(row["name"], text=f"{when[:1].upper()}{when[1:]}, {format_clock(r['start'])}",
                             fill=TEXT_HI)
-            c.itemconfigure(row["sub"], text=format_duration(r["end"] - r["start"]), fill=TEXT_MID)
+            c.itemconfigure(row["sub"], text=(f"Benchmark · {r.get('label') or 'No mode'}" if r.get("benchmark")
+                                              else format_duration(r["end"] - r["start"])),
+                            fill=SILVER if r.get("benchmark") else TEXT_MID)
             hot = (r.get("temp_peak") or 0) >= 85
             lossy = (r.get("ping_loss") or 0) >= 2 or (r.get("ping_spikes") or 0) >= 5
             c.itemconfigure(row["fps"], text="–" if r.get("fps_avg") is None
@@ -9772,6 +9954,8 @@ class OptimizerApp(ctk.CTk):
         c.coords(self.t_game_auto, self.px(ax + 18), self.px(ay + ah / 2))  # no switch in this view
         if self.compare_pick is not None:
             summary = f"Pick two sessions to compare ({len(self.compare_pick)} of 2 picked)"
+            if not any(r.get("benchmark") for r in sessions):
+                summary += f". For a fair test, press {BENCH_HOTKEY_LABEL} in the game: a {BENCH_SECONDS} s benchmark"
         else:
             summary = self._history_summary(sessions)
         c.itemconfigure(self.t_game_overlay, text="")
@@ -9853,6 +10037,12 @@ class OptimizerApp(ctk.CTk):
     def _compare_note(old: dict, new: dict) -> str:
         """Whether the two sessions can fairly be compared."""
         da, db = old["end"] - old["start"], new["end"] - new["start"]
+        if old.get("benchmark") and new.get("benchmark"):
+            a, b = old.get("label") or "No mode", new.get("label") or "No mode"
+            setup = f"{a} vs {b}" if a != b else f"both with {a}"
+            return f"Two {BENCH_SECONDS}-second benchmarks, {setup}. Same spot in the game both times keeps it fair."
+        if old.get("benchmark") or new.get("benchmark"):
+            return "A benchmark and a full session measure different stretches of play; compare two benchmarks instead."
         if old.get("fps_avg") is None or new.get("fps_avg") is None:
             return "One of these sessions has no FPS data, so only the other numbers compare."
         if min(da, db) < 300:
@@ -9887,8 +10077,15 @@ class OptimizerApp(ctk.CTk):
     def _history_summary(sessions: list[dict]) -> str:
         if not sessions:
             return ""
+        benches = sum(1 for r in sessions if r.get("benchmark"))
+        sessions = [r for r in sessions if not r.get("benchmark")]
         played = sum(r["end"] - r["start"] for r in sessions)
+        bench_text = f"{benches} benchmark{'s' if benches != 1 else ''}"
+        if not sessions:
+            return bench_text
         parts = [f"{len(sessions)} session{'s' if len(sessions) != 1 else ''}, {format_duration(played)} played"]
+        if benches:
+            parts[0] += f", {bench_text}"
         fps = [r["fps_avg"] for r in sessions if r.get("fps_avg") is not None]
         gpu = [r["gpu_avg"] for r in sessions if r.get("gpu_avg") is not None]
         temps = [r["temp_peak"] for r in sessions if r.get("temp_peak") is not None]
@@ -10725,6 +10922,8 @@ class OptimizerApp(ctk.CTk):
         self._last_tel = data
         for session in self.sessions_live.values():
             add_session_sample(session, data)
+        if self.bench and self.bench["phase"] == "running":
+            add_session_sample(self.bench["acc"], data)
         cpu = float(data["cpu"])
         ram = float(data["ram"])
         self.canvas.itemconfigure(self.t_cpu, text=f"{cpu:.0f}%")
@@ -10806,6 +11005,8 @@ class OptimizerApp(ctk.CTk):
         self._stop_hotkey()
         if self.overlay_hotkey is not None:
             self.overlay_hotkey.stop()
+        if self.bench_hotkey is not None:
+            self.bench_hotkey.stop()
         if self.overlay is not None:
             self.overlay.destroy()
         self._stop_tray()
