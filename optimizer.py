@@ -56,8 +56,8 @@ except Exception:  # pragma: no cover - depends on the build
 
 APP_NAME = "Astra Optimizer"
 LEGACY_APP_NAME = "Optimizer"  # pre-1.12 name: data folder and startup task are carried over
-APP_VERSION = "1.0.1"
-DISPLAY_VERSION = "v1.0.1"
+APP_VERSION = "1.1.0"
+DISPLAY_VERSION = "v1.1"
 CREDIT_NAME = "theplayerv2"
 CREDIT_URL = "https://guns.lol/playerv2"
 UPDATE_REPO = "theplayerv2/astra-optimizer"
@@ -1931,7 +1931,7 @@ EVENT_MODIFY_STATE = 0x0002
 SW_RESTORE = 9
 DEFAULT_SETTINGS = {"tray": True, "autostart": False, "hotkey": True, "custom_host": "", "tray_hint": False,
                     "preview": True, "games": [], "game_auto": False, "clean_skip": [], "dns_original": None,
-                    "restore_point": True, "restore_point_at": 0, "updates": True}
+                    "restore_point": True, "restore_point_at": 0, "updates": True, "sessions": []}
 
 
 # --------------------------------------------------------------------------------------
@@ -2817,6 +2817,447 @@ def human_size(nbytes: float) -> str:
 
 
 # --------------------------------------------------------------------------------------
+# Gaming checkup: settings that quietly cost performance. Read-only, except the refresh-rate
+# fix, which the user confirms first.
+# --------------------------------------------------------------------------------------
+
+class DEVMODEW(ctypes.Structure):
+    _fields_ = [("dmDeviceName", wintypes.WCHAR * 32), ("dmSpecVersion", wintypes.WORD),
+                ("dmDriverVersion", wintypes.WORD), ("dmSize", wintypes.WORD), ("dmDriverExtra", wintypes.WORD),
+                ("dmFields", wintypes.DWORD), ("dmPositionX", wintypes.LONG), ("dmPositionY", wintypes.LONG),
+                ("dmDisplayOrientation", wintypes.DWORD), ("dmDisplayFixedOutput", wintypes.DWORD),
+                ("dmColor", ctypes.c_short), ("dmDuplex", ctypes.c_short), ("dmYResolution", ctypes.c_short),
+                ("dmTTOption", ctypes.c_short), ("dmCollate", ctypes.c_short), ("dmFormName", wintypes.WCHAR * 32),
+                ("dmLogPixels", wintypes.WORD), ("dmBitsPerPel", wintypes.DWORD), ("dmPelsWidth", wintypes.DWORD),
+                ("dmPelsHeight", wintypes.DWORD), ("dmDisplayFlags", wintypes.DWORD),
+                ("dmDisplayFrequency", wintypes.DWORD), ("dmICMMethod", wintypes.DWORD),
+                ("dmICMIntent", wintypes.DWORD), ("dmMediaType", wintypes.DWORD), ("dmDitherType", wintypes.DWORD),
+                ("dmReserved1", wintypes.DWORD), ("dmReserved2", wintypes.DWORD),
+                ("dmPanningWidth", wintypes.DWORD), ("dmPanningHeight", wintypes.DWORD)]
+
+
+class DISPLAY_DEVICEW(ctypes.Structure):
+    _fields_ = [("cb", wintypes.DWORD), ("DeviceName", wintypes.WCHAR * 32), ("DeviceString", wintypes.WCHAR * 128),
+                ("StateFlags", wintypes.DWORD), ("DeviceID", wintypes.WCHAR * 128),
+                ("DeviceKey", wintypes.WCHAR * 128)]
+
+
+_display_api = ctypes.WinDLL("user32")  # own function objects, so these argtypes stay private
+_display_api.EnumDisplayDevicesW.argtypes = [wintypes.LPCWSTR, wintypes.DWORD, ctypes.POINTER(DISPLAY_DEVICEW),
+                                             wintypes.DWORD]
+_display_api.EnumDisplayDevicesW.restype = wintypes.BOOL
+_display_api.EnumDisplaySettingsW.argtypes = [wintypes.LPCWSTR, wintypes.DWORD, ctypes.POINTER(DEVMODEW)]
+_display_api.EnumDisplaySettingsW.restype = wintypes.BOOL
+_display_api.ChangeDisplaySettingsExW.argtypes = [wintypes.LPCWSTR, ctypes.POINTER(DEVMODEW), wintypes.HWND,
+                                                  wintypes.DWORD, ctypes.c_void_p]
+_display_api.ChangeDisplaySettingsExW.restype = wintypes.LONG
+ENUM_CURRENT_SETTINGS = 0xFFFFFFFF
+DISPLAY_DEVICE_ATTACHED_TO_DESKTOP, DISPLAY_DEVICE_PRIMARY_DEVICE = 0x1, 0x4
+DM_INTERLACED = 0x2
+DM_BITSPERPEL, DM_PELSWIDTH, DM_PELSHEIGHT, DM_DISPLAYFREQUENCY = 0x40000, 0x80000, 0x100000, 0x400000
+CDS_UPDATEREGISTRY, CDS_TEST = 0x1, 0x2
+
+CHECKUP_ITEMS = [("display", "Refresh rate"), ("memory", "Memory speed"), ("driver", "Graphics driver"),
+                 ("network", "Connection"), ("power", "Power")]
+DRIVER_PAGES = {"10DE": ("NVIDIA", "https://www.nvidia.com/en-us/drivers/"),
+                "1002": ("AMD", "https://www.amd.com/en/support/download/drivers.html"),
+                "8086": ("Intel", "https://www.intel.com/content/www/us/en/support/detect.html")}
+DRIVER_OLD_DAYS = 120
+MEMORY_TYPES = {24: "DDR3", 26: "DDR4", 34: "DDR5", 29: "LPDDR3", 30: "LPDDR4", 35: "LPDDR5"}
+JEDEC_TOP = {"DDR4": 2666, "DDR5": 4800}  # at or below this, XMP/EXPO is most likely off
+
+
+def _new_devmode() -> DEVMODEW:
+    mode = DEVMODEW()
+    mode.dmSize = ctypes.sizeof(DEVMODEW)
+    return mode
+
+
+def display_modes() -> list[dict]:
+    """Every display on the desktop: its refresh rate now and the highest one it offers at the
+    same resolution and colour depth. The main display comes first."""
+    displays, index = [], 0
+    while True:
+        dev = DISPLAY_DEVICEW()
+        dev.cb = ctypes.sizeof(DISPLAY_DEVICEW)
+        if not _display_api.EnumDisplayDevicesW(None, index, ctypes.byref(dev), 0):
+            break
+        index += 1
+        if not dev.StateFlags & DISPLAY_DEVICE_ATTACHED_TO_DESKTOP:
+            continue
+        current = _new_devmode()
+        if not _display_api.EnumDisplaySettingsW(dev.DeviceName, ENUM_CURRENT_SETTINGS, ctypes.byref(current)):
+            continue
+        best, mode, n = current.dmDisplayFrequency, _new_devmode(), 0
+        while n < 5000 and _display_api.EnumDisplaySettingsW(dev.DeviceName, n, ctypes.byref(mode)):
+            n += 1
+            if (mode.dmPelsWidth, mode.dmPelsHeight, mode.dmBitsPerPel) == \
+                    (current.dmPelsWidth, current.dmPelsHeight, current.dmBitsPerPel) \
+                    and not mode.dmDisplayFlags & DM_INTERLACED:
+                best = max(best, mode.dmDisplayFrequency)
+        monitor = DISPLAY_DEVICEW()
+        monitor.cb = ctypes.sizeof(DISPLAY_DEVICEW)
+        name = monitor.DeviceString if _display_api.EnumDisplayDevicesW(dev.DeviceName, 0, ctypes.byref(monitor), 0) \
+            else ""
+        displays.append({"device": dev.DeviceName, "monitor": name, "width": current.dmPelsWidth,
+                         "height": current.dmPelsHeight, "hz": current.dmDisplayFrequency, "max_hz": best,
+                         "primary": bool(dev.StateFlags & DISPLAY_DEVICE_PRIMARY_DEVICE)})
+    displays.sort(key=lambda d: not d["primary"])
+    return displays
+
+
+def set_display_refresh(device: str, hz: int) -> tuple[bool, str]:
+    """Switch one display to hz at its current resolution (tested first, then saved)."""
+    mode = _new_devmode()
+    if not _display_api.EnumDisplaySettingsW(device, ENUM_CURRENT_SETTINGS, ctypes.byref(mode)):
+        return False, "couldn't read the current display mode"
+    mode.dmDisplayFrequency = hz
+    mode.dmFields = DM_BITSPERPEL | DM_PELSWIDTH | DM_PELSHEIGHT | DM_DISPLAYFREQUENCY
+    rc = _display_api.ChangeDisplaySettingsExW(device, ctypes.byref(mode), None, CDS_TEST, None)
+    if rc != 0:
+        return False, f"Windows won't use {hz} Hz on this display (code {rc})"
+    rc = _display_api.ChangeDisplaySettingsExW(device, ctypes.byref(mode), None, CDS_UPDATEREGISTRY, None)
+    if rc == 1:
+        return True, "takes effect after a restart"
+    return (True, "") if rc == 0 else (False, f"Windows refused the change (code {rc})")
+
+
+def _display_label(displays: list[dict], display: dict) -> str:
+    return "Your display" if len(displays) == 1 else f"Display {displays.index(display) + 1}"
+
+
+def check_display(displays: list[dict] | None = None) -> dict:
+    if displays is None:
+        try:
+            displays = display_modes()
+        except Exception:
+            displays = []
+    if not displays:
+        return {"status": "info", "detail": "Couldn't read your display settings.", "value": ""}
+    slow = [d for d in displays if d["hz"] > 1 and d["max_hz"] - d["hz"] > 2]  # 59 vs 60 Hz is the same mode
+    if slow:
+        d = slow[0]
+        detail = (f"{_display_label(displays, d)} runs at {d['hz']} Hz but supports {d['max_hz']} Hz "
+                  f"at {d['width']}×{d['height']}.")
+        if len(slow) > 1:
+            detail += f" {len(slow) - 1} more display{'s' if len(slow) > 2 else ''} too."
+        return {"status": "warn", "detail": detail, "value": f"{d['hz']} Hz",
+                "action": ("display", f"Use {d['max_hz']} Hz"),
+                "fix": [(s["device"], s["max_hz"], _display_label(displays, s), s["hz"]) for s in slow]}
+    d = displays[0]
+    if len(displays) == 1:
+        detail = f"Already at its highest refresh rate: {d['hz']} Hz at {d['width']}×{d['height']}."
+    else:
+        detail = f"All {len(displays)} displays are at their highest refresh rate."
+    return {"status": "ok", "detail": detail, "value": f"{d['hz']} Hz"}
+
+
+def rated_memory_speed(part: str) -> int:
+    """Rated MT/s read from a module's part number (G.Skill F5-6000…, Corsair …6000C36,
+    Kingston KF560C…, Crucial …G32C16…), or 0 when it doesn't say."""
+    part = (part or "").upper().strip()
+    speeds = [int(v) for v in re.findall(r"(?<!\d)(\d{4})(?!\d)", part) if 2133 <= int(v) <= 8800]
+    match = re.match(r"KF(\d)(\d{2})C", part)
+    if match:
+        speeds.append(int(match.group(2)) * 100)
+    match = re.search(r"G(\d{2})C\d{2}", part)
+    if match and 21 <= int(match.group(1)) <= 88:
+        speeds.append(int(match.group(1)) * 100)
+    return max(speeds, default=0)
+
+
+def check_memory(modules: list[dict], laptop: bool) -> dict:
+    modules = [m for m in modules if (m.get("configured") or m.get("speed"))]
+    if not modules:
+        return {"status": "info", "detail": "Couldn't read your memory details.", "value": ""}
+    kind = MEMORY_TYPES.get(int(modules[0].get("type") or 0), "")
+    configured = min(int(m.get("configured") or m.get("speed")) for m in modules)
+    if configured < {"DDR4": 2000, "DDR5": 3200}.get(kind, 0):  # some firmware reports MHz, not MT/s
+        configured *= 2
+    rated = max((rated_memory_speed(m.get("part", "")) for m in modules), default=0)
+    label = f"{kind} " if kind else ""
+    value = f"{configured} MT/s"
+    if kind.startswith("LP"):
+        return {"status": "ok", "value": value,
+                "detail": f"{kind} at {configured} MT/s. It's built into the laptop, so its speed is fixed."}
+    if rated and rated - configured >= 200:
+        return {"status": "warn", "value": value,
+                "detail": f"Rated for {rated} MT/s but running at {configured}. Turn on XMP (Intel) or EXPO (AMD) "
+                          "in your BIOS."}
+    if not laptop and kind in JEDEC_TOP and configured <= JEDEC_TOP[kind]:
+        return {"status": "warn", "value": value,
+                "detail": f"Running at the standard {kind} speed. If your RAM is rated faster, turn on XMP or EXPO "
+                          "in your BIOS."}
+    return {"status": "ok", "value": value, "detail": f"{label}running at {configured} MT/s."}
+
+
+def _gpu_vendor(gpu: dict) -> str:
+    match = re.search(r"VEN_([0-9A-F]{4})", str(gpu.get("pnp") or "").upper())
+    return match.group(1) if match else ""
+
+
+def _nvidia_version(version: str) -> str:
+    digits = re.sub(r"\D", "", version or "")
+    return f"{digits[-5:-2]}.{digits[-2:]}" if len(digits) >= 5 else version
+
+
+def check_driver(gpus: list[dict], today: _dt.date | None = None) -> dict:
+    today = today or _dt.date.today()
+    fake = re.compile(r"microsoft basic|remote display|virtual|parsec|citrix|mirage|displaylink|idd", re.IGNORECASE)
+    real = [g for g in gpus if g.get("name") and not fake.search(g["name"])]
+    if not real:
+        basic = next((g for g in gpus if "basic" in str(g.get("name", "")).lower()), None)
+        if basic:
+            result = {"status": "warn", "value": "",
+                      "detail": "Windows is using its basic display driver, so games run badly or not at all. "
+                                "Install your graphics driver."}
+            vendor = DRIVER_PAGES.get(_gpu_vendor(basic))
+            if vendor:
+                result["action"] = ("link", "Get driver", vendor[1])
+            return result
+        return {"status": "info", "detail": "No graphics card found.", "value": ""}
+    gpu = sorted(real, key=lambda g: _gpu_vendor(g) not in ("10DE", "1002"))[0]  # a discrete card first
+    vendor_id = _gpu_vendor(gpu)
+    vendor = DRIVER_PAGES.get(vendor_id)
+    name = short_gpu_name(gpu["name"])
+    version = _nvidia_version(gpu.get("version", "")) if vendor_id == "10DE" else ""
+    try:
+        date = _dt.date.fromisoformat(str(gpu.get("date") or "")[:10])
+    except ValueError:
+        return {"status": "info", "value": version, "detail": f"{name}: couldn't read the driver date."}
+    age = (today - date).days
+    when = date.strftime("%B %Y")
+    if age > DRIVER_OLD_DAYS:
+        months = max(1, round(age / 30.4))
+        result = {"status": "warn", "value": version or date.strftime("%b %Y"),
+                  "detail": f"The {name} driver is from {when}, {months} months old. Newer ones often run "
+                            "recent games better."}
+        if vendor:
+            result["action"] = ("link", "Get driver", vendor[1])
+        return result
+    return {"status": "ok", "value": version or date.strftime("%b %Y"),
+            "detail": f"{name} driver from {when}, recent enough."}
+
+
+def _link_speed(bps: float) -> str:
+    if bps >= 1e9:
+        return f"{bps / 1e9:g} Gbps"
+    return f"{bps / 1e6:.0f} Mbps"
+
+
+def check_network(net: dict | None, wifi_signal: int | None = None) -> dict:
+    if not net:
+        return {"status": "info", "detail": "No internet connection found.", "value": ""}
+    desc = str(net.get("desc") or net.get("name") or "")
+    media = f"{net.get('media') or ''} {net.get('ndis') or ''}"
+    bps = float(net.get("bps") or 0)
+    wifi = "802.11" in media or re.search(r"wi-?fi|wireless|wlan|802\.11", desc, re.IGNORECASE)
+    tunnel = re.search(r"vpn|tap-|tun\b|wireguard|tailscale|zerotier|openvpn|nordlynx|wintun|cloudflare warp",
+                       desc, re.IGNORECASE)
+    if tunnel:
+        return {"status": "info", "value": "VPN",
+                "detail": f"Your traffic goes through {desc}, which can add ping in online games."}
+    if wifi:
+        signal = f" with {wifi_signal}% signal" if wifi_signal is not None else ""
+        return {"status": "warn", "value": "Wi-Fi",
+                "detail": f"You're on Wi-Fi{signal}. A network cable gives steadier ping in online games."}
+    if 0 < bps < 1e9 - 1:
+        return {"status": "warn", "value": _link_speed(bps),
+                "detail": f"Your cable link runs at {_link_speed(bps)}. Most PCs connect at 1 Gbps or more, so try "
+                          "another cable or router port."}
+    speed = f" at {_link_speed(bps)}" if bps else ""
+    return {"status": "ok", "value": "Ethernet", "detail": f"Wired connection{speed}."}
+
+
+def check_power(battery=None, probe: bool = True) -> dict:
+    if probe:
+        try:
+            battery = psutil.sensors_battery()
+        except Exception:
+            battery = None
+    if battery is None:
+        return {"status": "ok", "value": "Plugged in", "detail": "A desktop PC on wall power."}
+    percent = round(battery.percent)
+    if not battery.power_plugged:
+        return {"status": "warn", "value": f"{percent}%",
+                "detail": f"Running on battery ({percent}%). Laptops slow the CPU and GPU down on battery, so plug "
+                          "in before you play."}
+    return {"status": "ok", "value": "Plugged in", "detail": f"Plugged in, battery at {percent}%."}
+
+
+def _as_list(value) -> list:
+    if value is None:
+        return []
+    return value if isinstance(value, list) else [value]
+
+
+def checkup_system_info() -> dict:
+    """Memory modules, graphics adapters and the internet adapter in one PowerShell call."""
+    index = default_route_ifindex() or 0
+    script = (
+        "$ErrorActionPreference = 'SilentlyContinue'; "
+        "$m = @(Get-CimInstance Win32_PhysicalMemory | ForEach-Object { [pscustomobject]@{ "
+        "speed = [int]$_.Speed; configured = [int]$_.ConfiguredClockSpeed; type = [int]$_.SMBIOSMemoryType; "
+        "part = [string]$_.PartNumber } }); "
+        "$g = @(Get-CimInstance Win32_VideoController | ForEach-Object { [pscustomobject]@{ "
+        "name = [string]$_.Name; version = [string]$_.DriverVersion; pnp = [string]$_.PNPDeviceID; "
+        "date = $(if ($_.DriverDate) { $_.DriverDate.ToString('yyyy-MM-dd') } else { '' }) } }); "
+        "$n = $null; "
+        f"if ({index}) {{ $a = Get-NetAdapter -InterfaceIndex {index}; if ($a) {{ $n = [pscustomobject]@{{ "
+        "name = [string]$a.Name; desc = [string]$a.InterfaceDescription; media = [string]$a.PhysicalMediaType; "
+        "ndis = [string]$a.NdisPhysicalMedium; bps = [double]$a.ReceiveLinkSpeed } } }; "
+        "[pscustomobject]@{ memory = $m; gpus = $g; net = $n } | ConvertTo-Json -Compress -Depth 4")
+    rc, out = run_command([POWERSHELL, "-NoProfile", "-NonInteractive", "-Command", script], timeout=45)
+    try:
+        data = json.loads(out.strip().splitlines()[-1]) if rc == 0 else {}
+    except (ValueError, IndexError):
+        data = {}
+    return {"memory": _as_list(data.get("memory")), "gpus": _as_list(data.get("gpus")), "net": data.get("net")}
+
+
+def wifi_signal() -> int | None:
+    rc, out = run_command(["netsh", "wlan", "show", "interfaces"], timeout=10)
+    match = re.search(r"^\s*Signal\s*:\s*(\d+)\s*%", out, re.MULTILINE) if rc == 0 else None
+    return int(match.group(1)) if match else None
+
+
+def run_checkup() -> dict[str, dict]:
+    results = {"display": check_display(), "power": check_power()}
+    info = checkup_system_info()
+    results["memory"] = check_memory(info["memory"], laptop=has_battery())
+    results["driver"] = check_driver(info["gpus"])
+    net = info["net"]
+    is_wifi = bool(net) and ("802.11" in f"{net.get('media')} {net.get('ndis')}"
+                             or re.search(r"wi-?fi|wireless|wlan", str(net.get("desc")), re.IGNORECASE))
+    results["network"] = check_network(net, wifi_signal() if is_wifi else None)
+    return results
+
+
+# --------------------------------------------------------------------------------------
+# Game session reports
+# --------------------------------------------------------------------------------------
+
+SESSION_MIN_SECONDS = 60
+SESSION_PING_HOST = "1.1.1.1"
+SESSION_KEEP = 40
+
+
+class SessionPinger(threading.Thread):
+    """Pings Cloudflare every 2 s while a game runs; results go to the UI queue."""
+
+    def __init__(self, out_queue: queue.Queue, host: str = SESSION_PING_HOST, interval: float = 2.0):
+        super().__init__(name="session-ping", daemon=True)
+        self.out_queue, self.host, self.interval = out_queue, host, interval
+        self.stop_event = threading.Event()
+
+    def run(self) -> None:
+        while not self.stop_event.wait(self.interval):
+            try:
+                self.out_queue.put(("session-ping", icmp_ping(self.host)))
+            except Exception:
+                continue
+
+
+def new_session(exe: str, name: str, now: float | None = None) -> dict:
+    return {"exe": exe, "name": name, "start": now or time.time(), "n": 0, "cpu_sum": 0.0, "cpu_peak": 0.0,
+            "gpu_sum": 0.0, "gpu_n": 0, "gpu_peak": 0.0, "temp_peak": None, "ram_peak": 0.0, "pings": []}
+
+
+def add_session_sample(session: dict, data: dict) -> None:
+    cpu, ram = float(data.get("cpu") or 0), float(data.get("ram") or 0)
+    session["n"] += 1
+    session["cpu_sum"] += cpu
+    session["cpu_peak"] = max(session["cpu_peak"], cpu)
+    session["ram_peak"] = max(session["ram_peak"], ram)
+    gpu = data.get("gpu") or {}
+    if gpu.get("load") is not None:
+        session["gpu_sum"] += float(gpu["load"])
+        session["gpu_n"] += 1
+        session["gpu_peak"] = max(session["gpu_peak"], float(gpu["load"]))
+    if gpu.get("temp") is not None:
+        session["temp_peak"] = max(session["temp_peak"] or 0, float(gpu["temp"]))
+
+
+def finish_session(session: dict, now: float | None = None) -> dict | None:
+    """The saved report, or None for a session too short (or too empty) to be worth one."""
+    end = now or time.time()
+    if end - session["start"] < SESSION_MIN_SECONDS or not session["n"]:
+        return None
+    report = {"exe": session["exe"], "name": session["name"], "start": session["start"], "end": end,
+              "cpu_avg": session["cpu_sum"] / session["n"], "cpu_peak": session["cpu_peak"],
+              "ram_peak": session["ram_peak"], "temp_peak": session["temp_peak"],
+              "gpu_avg": session["gpu_sum"] / session["gpu_n"] if session["gpu_n"] else None,
+              "gpu_peak": session["gpu_peak"] if session["gpu_n"] else None}
+    pings = session["pings"]
+    answered = sorted(p for p in pings if p is not None)
+    if len(pings) >= 5 and answered:
+        median = answered[len(answered) // 2]
+        threshold = median + 50
+        report.update(ping_avg=sum(answered) / len(answered), ping_threshold=threshold,
+                      ping_spikes=sum(1 for p in answered if p > threshold),
+                      ping_loss=100.0 * (len(pings) - len(answered)) / len(pings))
+    return report
+
+
+def format_duration(seconds: float) -> str:
+    minutes = max(1, round(seconds / 60))
+    hours, minutes = divmod(minutes, 60)
+    return f"{hours} h {minutes} min" if hours else f"{minutes} min"
+
+
+def format_clock(stamp: float) -> str:
+    t = time.localtime(stamp)
+    return f"{(t.tm_hour % 12) or 12}:{t.tm_min:02d} {'AM' if t.tm_hour < 12 else 'PM'}"
+
+
+def format_day(stamp: float, now: float | None = None) -> str:
+    day = _dt.date.fromtimestamp(stamp)
+    today = _dt.date.fromtimestamp(now or time.time())
+    if day == today:
+        return "today"
+    if day == today - _dt.timedelta(days=1):
+        return "yesterday"
+    return f"{day.strftime('%b')} {day.day}"
+
+
+def session_report_text(report: dict) -> str:
+    lines = [f"Played for {format_duration(report['end'] - report['start'])}, "
+             f"{format_clock(report['start'])} to {format_clock(report['end'])}.", ""]
+    lines.append(f"CPU load: {report['cpu_avg']:.0f}% average, {report['cpu_peak']:.0f}% peak")
+    if report.get("gpu_avg") is not None:
+        lines.append(f"GPU load: {report['gpu_avg']:.0f}% average, {report['gpu_peak']:.0f}% peak")
+    if report.get("temp_peak") is not None:
+        lines.append(f"GPU temperature: {report['temp_peak']:.0f} °C at its hottest")
+    lines.append(f"Memory in use: {report['ram_peak']:.0f}% at its peak")
+    if report.get("ping_avg") is not None:
+        spikes = report["ping_spikes"]
+        spike_text = (f"{spikes} spike{'s' if spikes != 1 else ''} over {report['ping_threshold']:.0f} ms"
+                      if spikes else "no spikes")
+        loss = report["ping_loss"]
+        loss_text = "none lost" if loss < 0.5 else f"{loss:.0f}% lost"
+        lines.append(f"Ping to Cloudflare: {report['ping_avg']:.0f} ms average, {spike_text}, {loss_text}")
+    notes = []
+    if (report.get("temp_peak") or 0) >= 85:
+        notes.append("Your GPU ran hot. Dusty fans or poor case airflow are the usual cause.")
+    if (report.get("ping_loss") or 0) >= 2:
+        notes.append("Some pings were lost. On Wi-Fi, a network cable usually fixes this.")
+    if notes:
+        lines += [""] + notes
+    return "\n".join(lines)
+
+
+def session_summary(report: dict) -> str:
+    parts = [format_duration(report["end"] - report["start"])]
+    if report.get("gpu_avg") is not None:
+        parts.append(f"GPU {report['gpu_avg']:.0f}% average")
+    if report.get("temp_peak") is not None:
+        parts.append(f"{report['temp_peak']:.0f} °C peak")
+    if report.get("ping_avg") is not None:
+        parts.append(f"{report['ping_avg']:.0f} ms ping")
+    return " · ".join(parts)
+
+
+# --------------------------------------------------------------------------------------
 # UI - Galaxy theme
 #
 # Every visual is generated at runtime with Pillow (antialiased shapes, real blur glows,
@@ -2852,15 +3293,19 @@ L_CARDS = {"max": (78, 108, 202, 130), "cozy": (291, 108, 202, 130), "quality": 
 L_BUTTONS = {"optimize": (78, 250, 500, 48), "defaults": (586, 250, 120, 48)}
 L_CONSOLE = (78, 310, 628, 156)
 # Tools tab
-TOOL_PAGES = [("ping", "Ping"), ("games", "Games"), ("startup", "Startup"), ("cleanup", "Cleanup"),
-              ("dns", "DNS"), ("monitor", "Monitor")]
+TOOL_PAGES = [("checkup", "Checkup"), ("ping", "Ping"), ("games", "Games"), ("startup", "Startup"),
+              ("cleanup", "Cleanup"), ("dns", "DNS"), ("monitor", "Monitor")]
 L_TOOL_ACTION = (566, 48, 140, 38)
 L_TOOL_BUTTONS = {"ping": L_TOOL_ACTION, "host": (586, 424, 120, 42)}
-L_GAME_FIND = (446, 48, 112, 38)
-TOOL_PAGE_BUTTONS = {"ping": L_TOOL_BUTTONS, "games": {"findgames": L_GAME_FIND, "addgame": L_TOOL_ACTION},
+L_GAME_FIND = (510, 48, 94, 38)
+L_GAME_ADD = (610, 48, 96, 38)
+TOOL_PAGE_BUTTONS = {"checkup": {"checkup": L_TOOL_ACTION}, "ping": L_TOOL_BUTTONS,
+                     "games": {"findgames": L_GAME_FIND, "addgame": L_GAME_ADD},
                      "startup": {"refresh": L_TOOL_ACTION}, "cleanup": {"clean": L_TOOL_ACTION},
                      "dns": {"dnstest": L_TOOL_ACTION}, "monitor": {}}
-PRIMARY_TOOL_BUTTONS = {"ping", "clean", "dnstest"}
+PRIMARY_TOOL_BUTTONS = {"ping", "clean", "dnstest", "checkup"}
+L_CHECK_ROWS = {key: (78, 100 + i * 73, 628, 66) for i, (key, _title) in enumerate(CHECKUP_ITEMS)}
+L_CHECK_BTN = (112, 30)  # row action button, right-aligned in its row
 L_DNS_TABLE = (78, 100, 628, 280)
 L_DNS_ROW_Y0, L_DNS_ROW_H, DNS_ROWS = 134, 40, 6
 L_DNS_COLS = {"name": 94, "median": 384, "answered": 470, "use": 620}
@@ -2893,7 +3338,7 @@ L_DIALOG_W = 404
 # Appearance tab
 L_LOOK_RESET = (586, 50, 120, 36)
 L_LOOK_ROWS = {"background": (78, 100, 628, 88), "adjust": (78, 198, 628, 168), "motion": (78, 376, 628, 90)}
-L_SEGMENTS = {"bg": (386, 112, 300, 32), "motion": (326, 390, 360, 32), "tool": (78, 50, 360, 34)}
+L_SEGMENTS = {"bg": (386, 112, 300, 32), "motion": (326, 390, 360, 32), "tool": (78, 50, 424, 34)}
 L_LOOK_IMAGE_BTN = (98, 146, 140, 30)
 L_LOOK_HINT_Y = 161
 L_SLIDERS = {"blur": (228, 224, 370), "dim": (228, 262, 370), "glass": (228, 300, 370),
@@ -3353,6 +3798,34 @@ class GalaxyPainter:
         return self.shape(size, size, self.px(5), fill=(255, 255, 255, 10 if hover else 4),
                           border=(255, 255, 255, 200 if hover else 120), border_width=1.4)
 
+    def status_mark(self, size: int, status: str) -> Image.Image:
+        """Checkup row marks: ok = white ring with a tick, warn = yellow disc with '!', info = grey ring
+        with a dash (couldn't tell), pending = faint grey ring."""
+        return self._memo(("status", size, status), lambda: self._status_mark(size, status))
+
+    @staticmethod
+    def _status_mark(size: int, status: str) -> Image.Image:
+        big = size * 4
+        img = Image.new("RGBA", (big, big), (0, 0, 0, 0))
+        d = ImageDraw.Draw(img)
+        lw = max(2, round(big * 0.085))
+        box = (lw / 2 + 1, lw / 2 + 1, big - lw / 2 - 1, big - lw / 2 - 1)
+        if status == "ok":
+            d.ellipse(box, outline=rgba(STARLIGHT, 235), width=lw)
+            d.line([(big * 0.30, big * 0.52), (big * 0.44, big * 0.66), (big * 0.71, big * 0.37)],
+                   fill=rgba(STARLIGHT), width=lw, joint="curve")
+        elif status == "warn":
+            d.ellipse((1, 1, big - 1, big - 1), fill=rgba(WARN_YELLOW))
+            cx, half = big / 2, lw * 0.62
+            d.rounded_rectangle((cx - half, big * 0.22, cx + half, big * 0.60), radius=half, fill=rgba(VOID))
+            d.ellipse((cx - half * 1.15, big * 0.68, cx + half * 1.15, big * 0.68 + half * 2.3), fill=rgba(VOID))
+        elif status == "info":
+            d.ellipse(box, outline=rgba(ASH), width=lw)
+            d.line([(big * 0.32, big / 2), (big * 0.68, big / 2)], fill=rgba(ASH), width=lw)
+        else:
+            d.ellipse(box, outline=rgba(ASH, 140), width=lw)
+        return img.resize((size, size), Image.LANCZOS)
+
     def toggle(self, w: int, h: int, on: bool, state: str) -> Image.Image:
         """Switch. state: normal|hover|disabled."""
         hover = state == "hover"
@@ -3684,7 +4157,12 @@ class OptimizerApp(ctk.CTk):
         self._fade: dict | None = None
         self._overlay: dict | None = None
         self._frost_cache: dict = {}
-        self.tool_page = "ping"
+        self.tool_page = "checkup"
+        self.checkup_state = "idle"  # idle | running
+        self.checkup: dict[str, dict] = {}
+        self.checkup_at = 0.0
+        self.sessions_live: dict[str, dict] = {}
+        self.session_pinger: SessionPinger | None = None
         self.games: list[dict] = [dict(g) for g in (self._setting("games") or []) if isinstance(g, dict) and g.get("path")]
         self.game_offset = 0
         self.game_watcher: GameWatcher | None = None
@@ -3999,6 +4477,8 @@ class OptimizerApp(ctk.CTk):
         rows(games, [L_GAME_AUTO])
         cleanup = base.copy()
         rows(cleanup, L_CLEAN_ROWS.values())
+        checkup = base.copy()
+        rows(checkup, L_CHECK_ROWS.values())
         rows(dns, [L_DNS_BAR])
         monitor = base.copy()
         rows(monitor, L_MONITOR.values())
@@ -4007,7 +4487,7 @@ class OptimizerApp(ctk.CTk):
             for frac in (0.0, 0.5, 1.0):
                 self._hairline(monitor, cx, cy + ch * frac, cw, 1 / self.scale, 16 if frac in (0.0, 1.0) else 9)
 
-        self.backdrops = {"boost": boost, "tools:ping": tools, "tools:games": games, "tools:startup": startup,
+        self.backdrops = {"boost": boost, "tools:checkup": checkup, "tools:ping": tools,"tools:games": games, "tools:startup": startup,
                           "tools:cleanup": cleanup, "tools:dns": dns, "tools:monitor": monitor,
                           "appearance": appearance, "settings": settings, "about": self._about_backdrop(base, rows)}
         for img in self.backdrops.values():
@@ -4044,7 +4524,8 @@ class OptimizerApp(ctk.CTk):
     def _keep_clear(self) -> list:
         return [(0, 0, WINDOW_W, L_TITLE_H), L_RAIL_BOX, *L_ABOUT_ROWS.values(), *L_PILLS.values(), *L_CARDS.values(),
                 *L_BUTTONS.values(), L_CONSOLE, *L_TOOL_BUTTONS.values(), L_PING_TABLE, L_PING_HOST_FIELD,
-                L_SEGMENTS["tool"], L_GAME_AUTO, *L_CLEAN_ROWS.values(), L_GAME_FIND, L_DNS_BAR,
+                L_SEGMENTS["tool"], L_GAME_AUTO, *L_CLEAN_ROWS.values(), L_GAME_FIND, L_GAME_ADD, L_DNS_BAR,
+                *L_CHECK_ROWS.values(),
                 *L_MONITOR.values(),
                 *L_SETTING_ROWS.values(), L_FOLDER_ROW, *L_LOOK_ROWS.values(), L_LOOK_RESET]
 
@@ -4386,12 +4867,30 @@ class OptimizerApp(ctk.CTk):
     def _build_tool_pages(self) -> None:
         c, px = self.canvas, self.px
         tags = {page: ("ui", "tab-tools", f"page-{page}") for page, _ in TOOL_PAGES}
-        x, y, w, h = L_TOOL_ACTION
         for key, label, page in (("addgame", "Add game…", "games"), ("refresh", "Refresh", "startup"),
-                                 ("clean", "CLEAN UP", "cleanup"), ("dnstest", "RUN TEST", "dns")):
+                                 ("clean", "CLEAN UP", "cleanup"), ("dnstest", "RUN TEST", "dns"),
+                                 ("checkup", "RUN CHECKUP", "checkup")):
+            x, y, w, h = TOOL_PAGE_BUTTONS[page][key]
             self.t_buttons[key] = c.create_text(px(x + w / 2), px(y + h / 2), text=label, font=self.f_ghost,
                                                 fill=TEXT_HI, tags=tags[page])
         head_y = L_TABLE[1] + 11
+
+        # Checkup
+        ck = tags["checkup"]
+        self.t_check = {}
+        bw, bh = L_CHECK_BTN
+        for key, title in CHECKUP_ITEMS:
+            rx, ry, rw, rh = L_CHECK_ROWS[key]
+            self.t_check[key] = {
+                "title": c.create_text(px(rx + 52), px(ry + 12), anchor="nw", text=title, font=self.f_title,
+                                       fill=TEXT_HI, tags=ck),
+                "detail": c.create_text(px(rx + 52), px(ry + 37), anchor="nw", font=self.f_desc, fill=TEXT_MID,
+                                        tags=ck),
+                "value": c.create_text(px(rx + rw - 20), px(ry + rh / 2), anchor="e", font=self.f_plan,
+                                       fill=TEXT_HI, tags=ck),
+                "btn": c.create_text(px(rx + rw - 20 - bw / 2), px(ry + rh / 2), font=self.f_ghost_small,
+                                     fill=TEXT_HI, tags=ck),
+            }
 
         # Games
         g = tags["games"]
@@ -4506,6 +5005,7 @@ class OptimizerApp(ctk.CTk):
                 "bottom": c.create_text(px(cx + 4), px(cy + ch - 2), anchor="sw", font=self.f_label, fill=ASH,
                                         tags=mo),
             }
+        self._paint_checkup()
         self._paint_games()
         self._paint_startup()
         self._paint_cleanup()
@@ -4681,6 +5181,7 @@ class OptimizerApp(ctk.CTk):
             for page, _label in TOOL_PAGES:
                 if page != self.tool_page:
                     c.itemconfigure(f"page-{page}", state="hidden")
+            self._paint_checkup()
             self._paint_games()
             self._paint_startup()
             self._paint_cleanup()
@@ -4743,6 +5244,11 @@ class OptimizerApp(ctk.CTk):
         if key in ("optimize", "defaults"):
             return self.tab == "boost" and self.admin and not self.busy
         tools_page = self.tool_page if self.tab == "tools" else None
+        if kind == "chk":
+            return tools_page == "checkup" and self.checkup_state == "idle" \
+                and bool((self.checkup.get(key) or {}).get("action"))
+        if key == "checkup":
+            return tools_page == "checkup" and self.checkup_state == "idle"
         if kind == "game":
             return tools_page == "games"
         if kind == "startup":
@@ -4786,7 +5292,8 @@ class OptimizerApp(ctk.CTk):
     def _button_state(self, key: str) -> str:
         target = f"btn:{key}"
         if (key == "optimize" and self.busy) or (key == "ping" and self.ping_running) \
-                or (key == "clean" and self.clean_state != "idle") or (key == "dnstest" and self.dns_state == "testing"):
+                or (key == "clean" and self.clean_state != "idle") or (key == "dnstest" and self.dns_state == "testing") \
+                or (key == "checkup" and self.checkup_state == "running"):
             return "busy"
         if not self._enabled(target):
             return "disabled"
@@ -4999,6 +5506,27 @@ class OptimizerApp(ctk.CTk):
             img = self._cached(("toggle", on, state), lambda: self.painter.toggle(px(tw), px(th), on, state))
             paste_layer(scene, img, px(x), px(y))
 
+        if self.tool_page == "checkup":
+            bw, bh = L_CHECK_BTN
+            mark = 22
+            for key, (rx, ry, rw, rh) in L_CHECK_ROWS.items():
+                result = self.checkup.get(key)
+                status = result["status"] if result else "pending"
+                img = self.painter.status_mark(px(mark), status)
+                paste_layer(scene, img, px(rx + 18), px(ry + rh / 2 - mark / 2))
+                if result and result.get("action"):
+                    target = f"chk:{key}"
+                    state = "disabled" if not self._enabled(target) else (
+                        "pressed" if self.pressed == target and self.hover == target else
+                        "hover" if self.hover == target else "normal")
+                    img = self._cached(("ghost-check", state), lambda: self.painter.ghost_button(px(bw), px(bh), state))
+                    paste_layer(scene, img, px(rx + rw - 20 - bw), px(ry + (rh - bh) / 2))
+                    color = {"disabled": "#4D4D4D", "hover": "#FFFFFF", "pressed": "#FFFFFF"}.get(state, "#CFCFCF")
+                    self.canvas.itemconfigure(self.t_check[key]["btn"], fill=color)
+        if self.tool_page == "games" and not self.game_finder:
+            for i, row in enumerate(self.t_games):
+                if self.hover == f"game:report:{self.game_offset + i}":
+                    self.canvas.itemconfigure(row["sub"], fill=TEXT_HI)
         if self.tool_page == "ping" and self.host_focus:
             fx, fy, fw, fh = L_PING_HOST_FIELD
             ring = self._cached(("focus-ring", fw, fh), lambda: self.painter.shape(
@@ -5196,6 +5724,12 @@ class OptimizerApp(ctk.CTk):
                     return f"btn:{key}"
             if self.tool_page == "ping" and inside(L_PING_HOST_FIELD):
                 return "host:field"
+            if self.tool_page == "checkup":
+                bw, bh = L_CHECK_BTN
+                for key, (rx, ry, rw, rh) in L_CHECK_ROWS.items():
+                    if (self.checkup.get(key) or {}).get("action") \
+                            and inside((rx + rw - 20 - bw, ry + (rh - bh) / 2, bw, bh)):
+                        return f"chk:{key}"
             if self.tool_page == "games" and self.game_finder:
                 items = self.game_finder.get("items", [])
                 for i in range(min(GAME_ROWS, len(items) - self.game_offset)):
@@ -5222,6 +5756,9 @@ class OptimizerApp(ctk.CTk):
                         return f"game:fso:{index}"
                     if inside((L_GAME_COLS["del"] - 4, ry + 6, 36, 32)):
                         return f"game:del:{index}"
+                    if inside((L_GAME_COLS["name"] - 6, ry + 2, 362, L_GAME_ROW_H - 4)) \
+                            and self._last_session(self.games[index]["path"]):
+                        return f"game:report:{index}"
                 if inside(L_GAME_AUTO):
                     return "game:auto"
             elif self.tool_page == "startup" and self.startup_items:
@@ -5441,6 +5978,10 @@ class OptimizerApp(ctk.CTk):
         elif kind == "game":
             what, _, index = key.partition(":")
             self._game_action(what, int(index) if index else -1)
+        elif kind == "chk":
+            self._checkup_action(key)
+        elif target == "btn:checkup":
+            self._run_checkup()
         elif kind == "startup":
             self._toggle_startup(int(key))
         elif kind == "clean":
@@ -5536,6 +6077,8 @@ class OptimizerApp(ctk.CTk):
 
         self._transition(change)
         self._kick()
+        if key == "tools" and self.tool_page == "checkup":
+            self._maybe_auto_checkup()
 
     def _transition(self, change) -> None:
         """Crossfade the whole window - text, log and widgets included - into the result of change().
@@ -5639,6 +6182,8 @@ class OptimizerApp(ctk.CTk):
 
         self._transition(change)
         self._kick()
+        if page == "checkup":
+            self._maybe_auto_checkup()
         if page == "startup" and self.startup_items is None:
             self.after(30, self._load_startup)
         if page == "cleanup" and self.clean_state == "idle" and time.monotonic() - self.clean_scanned_at > 60:
@@ -5940,6 +6485,13 @@ class OptimizerApp(ctk.CTk):
                     self._render()
                 elif kind == "update":
                     self._on_update_result(*event[1:])
+                elif kind == "checkup":
+                    self._on_checkup(event[1])
+                elif kind == "display-fixed":
+                    self._on_display_fixed(event[1])
+                elif kind == "session-ping":
+                    for session in self.sessions_live.values():
+                        session["pings"].append(event[1])
                 elif kind == "game-start":
                     self._on_game_start(*event[1:])
                 elif kind == "game-stop":
@@ -6377,6 +6929,11 @@ class OptimizerApp(ctk.CTk):
             return
         game = self.games[index]
         name, path = game.get("name") or os.path.basename(game["path"]), game["path"]
+        if what == "report":
+            report = self._last_session(path)
+            if report:
+                self._show_session_report(report)
+            return
         if what == "prio":
             game["priority"] = not game.get("priority", True)
             self._save_games()
@@ -6408,6 +6965,155 @@ class OptimizerApp(ctk.CTk):
             self._emit("ok", f"{name} removed from your games")
         self._paint_games()
         self._render()
+
+    # ---------------- gaming checkup ----------------
+
+    def _paint_checkup(self) -> None:
+        c = self.canvas
+        bw = L_CHECK_BTN[0]
+        for key, _title in CHECKUP_ITEMS:
+            items, (rx, _ry, rw, _rh) = self.t_check[key], L_CHECK_ROWS[key]
+            result = self.checkup.get(key)
+            if result is None:
+                text = "Checking…" if self.checkup_state == "running" else "Not checked yet."
+                c.itemconfigure(items["detail"], text=text, width=0)
+                c.itemconfigure(items["value"], text="")
+                c.itemconfigure(items["btn"], text="")
+                continue
+            action = result.get("action")
+            value = "" if action else result.get("value", "")
+            right = bw + 16 if action else (self.f_plan.measure(value) / self.scale + 18 if value else 0)
+            room = rw - 52 - 20 - max(right, 90)
+            c.itemconfigure(items["detail"], text=result["detail"], width=self.px(room))
+            c.itemconfigure(items["value"], text=value)
+            c.itemconfigure(items["btn"], text=action[1] if action else "")
+
+    def _maybe_auto_checkup(self) -> None:
+        """First visit (or a stale result): run it straight away, it only reads."""
+        if self.checkup_state == "idle" and (not self.checkup_at or time.monotonic() - self.checkup_at > 600):
+            self.after(120, self._run_checkup)
+
+    def _run_checkup(self) -> None:
+        if self.checkup_state == "running":
+            return
+        self.checkup_state, self.checkup = "running", {}
+        self._paint_checkup()
+        self.canvas.configure(cursor="hand2" if self._enabled(self.hover) else "")
+        self._render()
+
+        def work() -> None:
+            try:
+                results = run_checkup()
+            except Exception as exc:
+                results = {"error": str(exc) or type(exc).__name__}
+            self.events.put(("checkup", results))
+
+        threading.Thread(target=work, name="checkup", daemon=True).start()
+
+    def _on_checkup(self, results: dict) -> None:
+        self.checkup_state, self.checkup_at = "idle", time.monotonic()
+        error = results.pop("error", None) if isinstance(results, dict) else "no results"
+        if error:
+            self._emit("fail", f"Checkup failed: {error}")
+        self.checkup = results
+        issues = [title for key, title in CHECKUP_ITEMS if (results.get(key) or {}).get("status") == "warn"]
+        if issues:
+            self._emit("info", f"Checkup: {len(issues)} thing{'s' if len(issues) != 1 else ''} to look at "
+                               f"({', '.join(t.lower() for t in issues)}). Details in Tools → Checkup")
+        elif not error:
+            self._emit("ok", "Checkup: everything looks good")
+        self._paint_checkup()
+        self.canvas.configure(cursor="hand2" if self._enabled(self.hover) else "")
+        self._render()
+
+    def _checkup_action(self, key: str) -> None:
+        result = self.checkup.get(key) or {}
+        action = result.get("action")
+        if not action:
+            return
+        if action[0] == "link":
+            self._open_link(action[2])
+            return
+        if action[0] == "display":
+            fixes = result["fix"]
+            lines = [f"{label}: {old} Hz → {hz} Hz" for _device, hz, label, old in fixes]
+            body = ("\n".join(lines) + "\n\nThe screen may go black for a moment while it switches. "
+                    "You can change it back in Windows display settings.")
+            self._open_dialog("Use the highest refresh rate?", body, action[1], lambda: self._fix_display(fixes))
+
+    def _fix_display(self, fixes: list) -> None:
+        self.checkup_state = "running"
+        self._render()
+
+        def work() -> None:
+            outcomes = []
+            for device, hz, label, _old in fixes:
+                try:
+                    ok, note = set_display_refresh(device, hz)
+                except Exception as exc:
+                    ok, note = False, str(exc)
+                outcomes.append((label, hz, ok, note))
+            self.events.put(("display-fixed", outcomes))
+
+        threading.Thread(target=work, name="display-fix", daemon=True).start()
+
+    def _on_display_fixed(self, outcomes: list) -> None:
+        for label, hz, ok, note in outcomes:
+            if ok:
+                self._emit("ok", f"{label} now runs at {hz} Hz" + (f" ({note})" if note else ""))
+            else:
+                self._emit("fail", f"{label}: couldn't switch to {hz} Hz - {note}")
+        self.checkup_state = "idle"
+        self.checkup["display"] = check_display()
+        self._paint_checkup()
+        self.canvas.configure(cursor="hand2" if self._enabled(self.hover) else "")
+        self._render()
+
+    # ---------------- game session reports ----------------
+
+    def _start_session(self, exe: str) -> None:
+        if exe in self.sessions_live:
+            return
+        self.sessions_live[exe] = new_session(exe, self._game_name(exe))
+        if self.session_pinger is None:
+            self.session_pinger = SessionPinger(self.events)
+            self.session_pinger.start()
+
+    def _end_session(self, exe: str) -> None:
+        session = self.sessions_live.pop(exe, None)
+        if not self.sessions_live and self.session_pinger is not None:
+            self.session_pinger.stop_event.set()
+            self.session_pinger = None
+        if session is None:
+            return
+        report = finish_session(session)
+        if report is None:
+            return
+        saved = list(self._setting("sessions") or [])
+        saved.append(report)
+        self._set_setting("sessions", saved[-SESSION_KEEP:])
+        self._emit("info", f"{report['name']} session: {session_summary(report)}. Report in Tools → Games")
+        if self._window_visible() and not self.dialog:
+            self._show_session_report(report)
+        else:
+            self._notify(f"{report['name']} session", session_summary(report))
+
+    def _last_session(self, path: str) -> dict | None:
+        exe = os.path.normcase(path)
+        for report in reversed(self._setting("sessions") or []):
+            if os.path.normcase(report.get("exe", "")) == exe:
+                return report
+        return None
+
+    def _show_session_report(self, report: dict) -> None:
+        self._open_dialog(f"{report['name']} session", session_report_text(report), "Done", lambda: None,
+                          cancel_label=None, width=460)
+
+    def _window_visible(self) -> bool:
+        try:
+            return self.state() == "normal" and not user32.IsIconic(self._hwnd())
+        except tk.TclError:
+            return False
 
     def _paint_games(self) -> None:
         c = self.canvas
@@ -6459,6 +7165,10 @@ class OptimizerApp(ctk.CTk):
                 c.itemconfigure(items["sub"], text=sub, fill=TEXT_HI)
             elif not os.path.isfile(game["path"]):
                 c.itemconfigure(items["sub"], text="File not found - it may have moved", fill=WARN_YELLOW)
+            elif (last := self._last_session(game["path"])) is not None:
+                sub = (f"Last played {format_day(last['end'])} for {format_duration(last['end'] - last['start'])}"
+                       "  ·  View report")
+                c.itemconfigure(items["sub"], text=self._fit(sub, self.f_label, 350), fill=SILVER)
             else:
                 c.itemconfigure(items["sub"], text=self._fit(game["path"], self.f_label, 350), fill=TEXT_MID)
         c.itemconfigure(self.t_games_empty, text="" if self.games else
@@ -6467,6 +7177,7 @@ class OptimizerApp(ctk.CTk):
 
     def _on_game_start(self, pid: int, exe: str, wanted: bool, error: str | None) -> None:
         name = self._game_name(exe)
+        self._start_session(exe)
         if wanted and error is None:
             self._emit("ok", f"{name} started - CPU priority set to High")
         elif wanted:
@@ -6484,6 +7195,8 @@ class OptimizerApp(ctk.CTk):
 
     def _on_game_stop(self, pid: int, exe: str) -> None:
         self._emit("info", f"{self._game_name(exe)} closed")
+        if exe not in self._running_games().values():  # its last process is gone
+            self._end_session(exe)
         self._paint_games()
         if self._game_auto and not self._running_games():
             self._game_auto = None
@@ -7163,6 +7876,8 @@ class OptimizerApp(ctk.CTk):
             self.canvas.itemconfigure(rect, fill=color)
 
     def _update_telemetry(self, data: dict) -> None:
+        for session in self.sessions_live.values():
+            add_session_sample(session, data)
         cpu = float(data["cpu"])
         ram = float(data["ram"])
         self.canvas.itemconfigure(self.t_cpu, text=f"{cpu:.0f}%")
@@ -7234,6 +7949,8 @@ class OptimizerApp(ctk.CTk):
         self._closing = True
         self.telemetry.stop_event.set()
         self._ping_stop.set()
+        if self.session_pinger is not None:
+            self.session_pinger.stop_event.set()
         if self.game_watcher is not None:
             self.game_watcher.stop_event.set()
         self._stop_hotkey()

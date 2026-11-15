@@ -27,8 +27,10 @@ Before anything runs you see a preview of what will change on *your* PC, and aft
 
 ### Tools
 
+- **Checkup**: one scan for settings that quietly cost performance: a monitor below its top refresh rate (fixed in one click), RAM below its rated speed (XMP/EXPO off), an old graphics driver, playing on Wi-Fi or a slow cable link, and a laptop on battery.
 - **Ping**: latency, jitter and packet loss to your router, Cloudflare, Google, several cloud regions and any server you type in.
 - **Games**: add games by hand or let **Find games** scan Steam, Epic Games, Riot and GOG. Each game gets high CPU priority whenever it runs, an optional *fullscreen optimizations off* switch, and an option to apply your mode while it runs and undo it when it closes.
+- **Session reports**: when a game closes you get a summary of how long you played, CPU and GPU load, the hottest GPU temperature and ping spikes. The last one stays on the game's row.
 - **Startup**: turn apps that launch with Windows on or off, using the same switches as Task Manager.
 - **Cleanup**: clears old files from your temp folders and old crash reports. Only files untouched for a day are removed, and it asks first.
 - **DNS**: measures how fast your current DNS and Cloudflare, Google, Quad9, OpenDNS and AdGuard answer, and switches with one click. *Restore previous* puts your old setting back.
@@ -42,7 +44,7 @@ Before anything runs you see a preview of what will change on *your* PC, and aft
 
 | | |
 |---|---|
-| <img src="docs/screenshots/tools-ping.png" alt="Tools tab, ping tester"> | <img src="docs/screenshots/appearance.png" alt="Appearance tab"> |
+| <img src="docs/screenshots/tools-checkup.png" alt="Tools tab, gaming checkup"> | <img src="docs/screenshots/appearance.png" alt="Appearance tab"> |
 | <img src="docs/screenshots/settings.png" alt="Settings tab"> | <img src="docs/screenshots/about.png" alt="About tab"> |
 
 ## Safe by design
