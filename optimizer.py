@@ -56,8 +56,8 @@ except Exception:  # pragma: no cover - depends on the build
 
 APP_NAME = "Astra Optimizer"
 LEGACY_APP_NAME = "Optimizer"  # pre-1.12 name: data folder and startup task are carried over
-APP_VERSION = "1.5.0"
-DISPLAY_VERSION = "v1.5.0"
+APP_VERSION = "1.6.0"
+DISPLAY_VERSION = "v1.6.0"
 CREDIT_NAME = "theplayerv2"
 UPDATE_REPO = "theplayerv2/astra-optimizer"
 CREDIT_URL = f"https://github.com/{UPDATE_REPO}"
@@ -2422,7 +2422,8 @@ DEFAULT_SETTINGS = {"tray": True, "autostart": False, "hotkey": True, "custom_ho
                     "preview": True, "games": [], "game_auto": False, "clean_skip": [], "clean_weekly": False, "clean_at": 0,
                     "dns_original": None,
                     "restore_point": True, "restore_point_at": 0, "updates": True, "sessions": [],
-                    "overlay": True, "overlay_pos": None, "overlay_style": None}
+                    "overlay": True, "overlay_pos": None, "overlay_style": None,
+                    "slow_background": False}
 
 
 # --------------------------------------------------------------------------------------
@@ -3013,9 +3014,8 @@ PROCESS_POWER_THROTTLING_EXECUTION_SPEED = 0x1
 PROCESS_POWER_THROTTLING_IGNORE_TIMER_RESOLUTION = 0x4
 
 
-def disable_power_throttling(pid: int) -> bool:
-    """Opt a game out of Windows' power throttling (EcoQoS), so it isn't slowed down to save power
-    and its timer requests are honoured even when it's in the background. Lasts until it exits."""
+def _set_power_throttling(pid: int, attempts: tuple[tuple[int, int], ...]) -> bool:
+    """SetProcessInformation(ProcessPowerThrottling) with the first (control, state) pair that works."""
     try:
         handle = _proc_api.OpenProcess(PROCESS_SET_INFORMATION, False, pid)
     except Exception:
@@ -3023,9 +3023,8 @@ def disable_power_throttling(pid: int) -> bool:
     if not handle:
         return False
     try:
-        for mask in (PROCESS_POWER_THROTTLING_EXECUTION_SPEED | PROCESS_POWER_THROTTLING_IGNORE_TIMER_RESOLUTION,
-                     PROCESS_POWER_THROTTLING_EXECUTION_SPEED):  # the timer flag needs Windows 11
-            state = _PowerThrottlingState(1, mask, 0)  # control these, state 0 = never throttle
+        for control, state_mask in attempts:
+            state = _PowerThrottlingState(1, control, state_mask)
             if _proc_api.SetProcessInformation(handle, 4, ctypes.byref(state), ctypes.sizeof(state)):
                 return True
         return False
@@ -3033,17 +3032,124 @@ def disable_power_throttling(pid: int) -> bool:
         kernel32.CloseHandle(handle)
 
 
+def disable_power_throttling(pid: int) -> bool:
+    """Opt a game out of Windows' power throttling (EcoQoS), so it isn't slowed down to save power
+    and its timer requests are honoured even when it's in the background. Lasts until it exits."""
+    both = PROCESS_POWER_THROTTLING_EXECUTION_SPEED | PROCESS_POWER_THROTTLING_IGNORE_TIMER_RESOLUTION
+    # control these flags, state 0 = never throttle; the timer flag needs Windows 11
+    return _set_power_throttling(pid, ((both, 0), (PROCESS_POWER_THROTTLING_EXECUTION_SPEED, 0)))
+
+
+def set_efficiency_mode(pid: int, on: bool) -> bool:
+    """Windows' efficiency mode (EcoQoS) for one process: on = run it slowly and on efficient cores,
+    off = hand the choice back to Windows (what every process starts with)."""
+    speed = PROCESS_POWER_THROTTLING_EXECUTION_SPEED
+    return _set_power_throttling(pid, ((speed, speed),) if on else ((0, 0),))
+
+
+# Apps that keep working in the background while you play. While a game runs, the "Slow background
+# apps" switch drops them to below-normal priority and efficiency mode; both go back when the game
+# closes. Voice, music and anything a game needs (Discord, Spotify, Teams, the Steam client itself,
+# anti-cheat, Riot's client) are deliberately missing so calls and audio never crackle.
+BACKGROUND_APPS = {
+    "chrome.exe": "Chrome", "msedge.exe": "Edge", "firefox.exe": "Firefox", "brave.exe": "Brave",
+    "opera.exe": "Opera", "vivaldi.exe": "Vivaldi",
+    "steamwebhelper.exe": "Steam's store window", "epicgameslauncher.exe": "Epic Games Launcher",
+    "epicwebhelper.exe": "Epic Games Launcher", "battle.net.exe": "Battle.net", "eadesktop.exe": "EA app",
+    "upc.exe": "Ubisoft Connect", "galaxyclient.exe": "GOG Galaxy",
+    "onedrive.exe": "OneDrive", "dropbox.exe": "Dropbox", "googledrivefs.exe": "Google Drive",
+}
+
+
+class BackgroundApps:
+    """Slows BACKGROUND_APPS while a game runs and puts them back afterwards. What it touched is kept
+    in a small file, so if Astra Optimizer is closed or crashes mid-game the next start undoes it."""
+
+    def __init__(self, path: str):
+        self.path = path
+        self._lock = threading.Lock()
+        self.touched: dict[int, dict] = {}  # pid -> {"name", "created"}
+        self.closed = False  # set on exit, so a scan finishing late can't slow anything again
+        try:
+            with open(path, encoding="utf-8") as handle:
+                saved = json.load(handle)
+            self.touched = {int(pid): info for pid, info in saved.items()
+                            if isinstance(info, dict) and isinstance(info.get("created"), (int, float))}
+        except (OSError, ValueError, TypeError, AttributeError):
+            pass
+
+    def _save(self) -> None:
+        try:
+            if self.touched:
+                os.makedirs(os.path.dirname(self.path), exist_ok=True)
+                tmp = self.path + ".tmp"
+                with open(tmp, "w", encoding="utf-8") as handle:
+                    json.dump({str(pid): info for pid, info in self.touched.items()}, handle)
+                os.replace(tmp, self.path)
+            elif os.path.exists(self.path):
+                os.remove(self.path)
+        except OSError:
+            pass
+
+    def slow(self, candidates: list) -> list[str]:
+        """Slow the given psutil processes (already filtered to BACKGROUND_APPS). Only ones at normal
+        priority are touched, so a priority someone chose on purpose is left alone. Returns the
+        names of the apps newly slowed."""
+        names = []
+        with self._lock:
+            for proc in candidates if not self.closed else ():
+                pid = proc.pid
+                if pid in self.touched:
+                    continue
+                try:
+                    if proc.nice() != psutil.NORMAL_PRIORITY_CLASS:
+                        continue
+                    created = proc.create_time()
+                    proc.nice(psutil.BELOW_NORMAL_PRIORITY_CLASS)
+                except (psutil.Error, OSError):
+                    continue
+                set_efficiency_mode(pid, True)
+                name = (proc.info.get("name") or "").lower() if hasattr(proc, "info") else ""
+                self.touched[pid] = {"name": name, "created": created}
+                names.append(BACKGROUND_APPS.get(name, name))
+            if names:
+                self._save()
+        return names
+
+    def restore(self) -> int:
+        """Put every process slowed earlier back to normal. Returns how many were still running."""
+        count = 0
+        with self._lock:
+            for pid, info in self.touched.items():
+                try:
+                    proc = psutil.Process(pid)
+                    if abs(proc.create_time() - info["created"]) > 1:  # the pid now belongs to something else
+                        continue
+                    if proc.nice() == psutil.BELOW_NORMAL_PRIORITY_CLASS:
+                        proc.nice(psutil.NORMAL_PRIORITY_CLASS)
+                    set_efficiency_mode(pid, False)
+                    count += 1
+                except (psutil.Error, OSError):
+                    continue
+            self.touched.clear()
+            self._save()
+        return count
+
+
 class GameWatcher(threading.Thread):
     """Checks running processes every 2 s for the user's games, raises their priority when they
     start, and reports starts/stops to the UI queue."""
 
-    def __init__(self, out_queue: queue.Queue):
+    def __init__(self, out_queue: queue.Queue, background: BackgroundApps | None = None):
         super().__init__(name="games", daemon=True)
         self.out_queue = out_queue
         self.stop_event = threading.Event()
         self._lock = threading.Lock()
         self._games: dict[str, bool] = {}  # normcase path -> raise priority
         self.running: dict[int, str] = {}   # pid -> normcase path
+        self.background = background or BackgroundApps(os.path.join(STATE_DIR, "background_apps.json"))
+        self.slow_background = False
+        self._slow_announced = False
 
     def set_games(self, games: list[dict]) -> None:
         table = {os.path.normcase(g["path"]): bool(g.get("priority", True)) for g in games}
@@ -3066,9 +3172,13 @@ class GameWatcher(threading.Thread):
             games = dict(self._games)
         names = {os.path.basename(path) for path in games}
         seen: dict[int, str] = {}
+        extra: list = []  # background apps running right now
         if names:
             for proc in psutil.process_iter(["pid", "name"]):
-                if (proc.info.get("name") or "").lower() not in names:
+                name = (proc.info.get("name") or "").lower()
+                if name in BACKGROUND_APPS and name not in names:
+                    extra.append(proc)
+                if name not in names:
                     continue
                 try:
                     exe = os.path.normcase(proc.exe())
@@ -3086,6 +3196,30 @@ class GameWatcher(threading.Thread):
             if pid not in seen:
                 self.out_queue.put(("game-stop", pid, exe))
         self.running = seen
+        self._update_background(bool(seen), extra)
+
+    def _update_background(self, playing: bool, extra: list) -> None:
+        """Slow background apps while a game runs (new ones too: browsers keep starting processes),
+        and put them back once no game is left, the switch goes off or Astra Optimizer closes."""
+        if playing and self.slow_background and not self.stop_event.is_set():
+            names = self.background.slow(extra)
+            if names and not self._slow_announced:
+                self._slow_announced = True
+                self.out_queue.put(("background-slowed", names))
+        elif self.background.touched:
+            count = self.background.restore()
+            if self._slow_announced or count:
+                self.out_queue.put(("background-restored", count))
+            self._slow_announced = False
+        else:
+            self._slow_announced = False
+
+    def stop(self) -> None:
+        """Stop scanning and put background apps back straight away."""
+        self.stop_event.set()
+        with self.background._lock:
+            self.background.closed = True
+        self.background.restore()
 
 
 # Finding installed games (Steam, Epic, Riot, GOG)
@@ -4679,9 +4813,11 @@ L_TABLE = (78, 100, 628, 312)
 L_GAME_ROW_Y0, L_GAME_ROW_H, GAME_ROWS = 134, 46, 6
 L_GAME_COLS = {"name": 94, "prio": 466, "fso": 566, "del": 664}
 L_GAME_AUTO = (78, 424, 628, 42)
-L_GAME_SPLIT = 318  # the bottom row holds two switches: game auto mode | overlay
-GAME_AUTO_TEXT = "Apply my mode while a game runs"
-GAME_OVERLAY_TEXT = f"Show the FPS overlay  ·  {OVERLAY_HOTKEY_LABEL}"
+L_GAME_SPLIT = 210   # the bottom row holds three switches: auto mode | overlay | background apps
+L_GAME_SPLIT2 = 414
+GAME_AUTO_TEXT = "Auto-apply my mode"
+GAME_OVERLAY_TEXT = f"FPS overlay · {OVERLAY_HOTKEY_LABEL}"
+GAME_BACKGROUND_TEXT = "Slow background apps"
 L_HIST_COLS = {"fps": 382, "cpu": 456, "gpu": 522, "temp": 588, "ping": 654}  # centre of each stat column
 L_CMP_COLS = {"a": 438, "b": 540, "chg": 646}  # Compare view: older, newer, change
 COMPARE_METRICS = [  # key, label, hint, unit, which way is better
@@ -6695,6 +6831,8 @@ class OptimizerApp(ctk.CTk):
                                          tags=g, text=GAME_AUTO_TEXT)
         self.t_game_overlay = c.create_text(px(ax + L_GAME_SPLIT + 58), px(ay + ah / 2), anchor="w", font=self.f_desc,
                                             fill=TEXT_HI, tags=g, text=GAME_OVERLAY_TEXT)
+        self.t_game_background = c.create_text(px(ax + L_GAME_SPLIT2 + 58), px(ay + ah / 2), anchor="w",
+                                               font=self.f_desc, fill=TEXT_HI, tags=g, text=GAME_BACKGROUND_TEXT)
 
         # Startup apps
         st = tags["startup"]
@@ -7360,6 +7498,7 @@ class OptimizerApp(ctk.CTk):
             ax, ay, aw, ah = L_GAME_AUTO
             toggle("game:auto", bool(self._setting("game_auto")), ax + 18, ay + (ah - th) / 2)
             toggle("game:overlay", bool(self._setting("overlay")), ax + L_GAME_SPLIT, ay + (ah - th) / 2)
+            toggle("game:background", bool(self._setting("slow_background")), ax + L_GAME_SPLIT2, ay + (ah - th) / 2)
         elif self.tool_page == "dns":
             current = set(self.dns_info["servers"]) if self.dns_info else set()
             for i, row in enumerate(self.dns_rows):
@@ -7395,6 +7534,7 @@ class OptimizerApp(ctk.CTk):
             ax, ay, aw, ah = L_GAME_AUTO
             toggle("game:auto", bool(self._setting("game_auto")), ax + 18, ay + (ah - th) / 2)
             toggle("game:overlay", bool(self._setting("overlay")), ax + L_GAME_SPLIT, ay + (ah - th) / 2)
+            toggle("game:background", bool(self._setting("slow_background")), ax + L_GAME_SPLIT2, ay + (ah - th) / 2)
         elif self.tool_page == "startup" and self.startup_items:
             for i in range(min(START_ROWS, len(self.startup_items) - self.startup_offset)):
                 index = self.startup_offset + i
@@ -7582,7 +7722,7 @@ class OptimizerApp(ctk.CTk):
                     if inside((L_TABLE[0] + 6, ry - 2, L_TABLE[2] - 12, L_GAME_ROW_H)):
                         return f"find:{self.game_offset + i}"
                 if inside(L_GAME_AUTO):
-                    return "game:auto" if lx < L_GAME_AUTO[0] + L_GAME_SPLIT - 8 else "game:overlay"
+                    return self._game_switch_at(lx)
             elif self.tool_page == "dns":
                 current = set(self.dns_info["servers"]) if self.dns_info else set()
                 for i, row in enumerate(self.dns_rows):
@@ -7605,7 +7745,7 @@ class OptimizerApp(ctk.CTk):
                             and self._last_session(self.games[index]["path"]):
                         return f"game:report:{index}"
                 if inside(L_GAME_AUTO):
-                    return "game:auto" if lx < L_GAME_AUTO[0] + L_GAME_SPLIT - 8 else "game:overlay"
+                    return self._game_switch_at(lx)
             elif self.tool_page == "startup" and self.startup_items:
                 for i in range(min(START_ROWS, len(self.startup_items) - self.startup_offset)):
                     ry = L_START_ROW_Y0 + i * L_START_ROW_H
@@ -8409,6 +8549,12 @@ class OptimizerApp(ctk.CTk):
                     self._on_game_start(*event[1:])
                 elif kind == "game-stop":
                     self._on_game_stop(*event[1:])
+                elif kind == "background-slowed":
+                    apps = list(dict.fromkeys(event[1]))
+                    shown = ", ".join(apps[:4]) + (f" and {len(apps) - 4} more" if len(apps) > 4 else "")
+                    self._emit("ok", f"Slowed background apps while you play: {shown}")
+                elif kind == "background-restored":
+                    self._emit("info", "Background apps are back to normal")
                 elif kind in ("clean-scan", "clean-done"):
                     self._on_clean_event(kind, event[1])
                 elif kind == "games-found":
@@ -9061,6 +9207,8 @@ class OptimizerApp(ctk.CTk):
         elif not merged.get("hotkey") and self.hotkey is not None:
             self._stop_hotkey()
         self._schedule_update_check(5000 if merged.get("updates") else None)
+        if self.game_watcher is not None:
+            self.game_watcher.slow_background = bool(merged.get("slow_background"))
         self.host_value = merged.get("custom_host") or ""
         self.host_cursor = len(self.host_value)
         for row in self.ping_rows:
@@ -9095,6 +9243,7 @@ class OptimizerApp(ctk.CTk):
     def _start_game_watcher(self) -> None:
         if self.game_watcher is None:
             self.game_watcher = GameWatcher(self.events)
+            self.game_watcher.slow_background = bool(self._setting("slow_background"))
             self.game_watcher.set_games(self.games)
             self.game_watcher.start()
 
@@ -9137,7 +9286,22 @@ class OptimizerApp(ctk.CTk):
         self._paint_games()
         self._render()
 
+    @staticmethod
+    def _game_switch_at(lx: float) -> str:
+        rel = lx - L_GAME_AUTO[0]
+        return "game:auto" if rel < L_GAME_SPLIT - 8 else "game:overlay" if rel < L_GAME_SPLIT2 - 8 else "game:background"
+
     def _game_action(self, what: str, index: int) -> None:
+        if what == "background":
+            on = not self._setting("slow_background")
+            self._set_setting("slow_background", on)
+            if self.game_watcher is not None:
+                self.game_watcher.slow_background = on
+            self._emit("ok", "While a game runs, browsers, launchers and cloud sync get low priority and "
+                             "efficiency mode. Discord and Spotify are left alone." if on
+                       else "Background apps are no longer slowed while you play")
+            self._render()
+            return
         if what == "overlay":
             on = not self._setting("overlay")
             self._set_setting("overlay", on)
@@ -9611,6 +9775,7 @@ class OptimizerApp(ctk.CTk):
         else:
             summary = self._history_summary(sessions)
         c.itemconfigure(self.t_game_overlay, text="")
+        c.itemconfigure(self.t_game_background, text="")
         c.itemconfigure(self.t_game_auto, text=self._fit(summary, self.f_desc, aw - 36))
 
     def _clear_compare_texts(self) -> None:
@@ -9681,6 +9846,7 @@ class OptimizerApp(ctk.CTk):
         ax, ay, aw, ah = L_GAME_AUTO
         c.coords(self.t_game_auto, self.px(ax + 18), self.px(ay + ah / 2))
         c.itemconfigure(self.t_game_overlay, text="")
+        c.itemconfigure(self.t_game_background, text="")
         c.itemconfigure(self.t_game_auto, text=self._fit(self._compare_note(old, new), self.f_desc, aw - 36))
 
     @staticmethod
@@ -9753,6 +9919,7 @@ class OptimizerApp(ctk.CTk):
         c.coords(self.t_game_auto, self.px(ax + 76), self.px(ay + ah / 2))
         c.itemconfigure(self.t_game_auto, text=GAME_AUTO_TEXT)
         c.itemconfigure(self.t_game_overlay, text=GAME_OVERLAY_TEXT)
+        c.itemconfigure(self.t_game_background, text=GAME_BACKGROUND_TEXT)
         c.itemconfigure(self.t_buttons["findgames"], text="Cancel" if finder else "Find games")
         if finder:
             items = finder.get("items", [])
@@ -10635,7 +10802,7 @@ class OptimizerApp(ctk.CTk):
             if session.get("capture") is not None:
                 session["capture"].stop(wait=1.0)
         if self.game_watcher is not None:
-            self.game_watcher.stop_event.set()
+            self.game_watcher.stop()
         self._stop_hotkey()
         if self.overlay_hotkey is not None:
             self.overlay_hotkey.stop()

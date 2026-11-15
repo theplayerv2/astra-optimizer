@@ -4,6 +4,19 @@ What changed in each version of Astra Optimizer. The newest version is at the to
 
 When a version is tagged on GitHub (for example `v1.2.0`), its section below becomes the release notes.
 
+## v1.6.0 - 2026-11-16
+
+### Added
+- **Slow background apps:** a new switch under Tools > Games. While a game runs, browsers (Chrome, Edge, Firefox,
+  Brave, Opera, Vivaldi), game launchers (Steam's store window, Epic, Battle.net, EA app, Ubisoft Connect, GOG Galaxy)
+  and cloud sync (OneDrive, Dropbox, Google Drive) drop to below-normal priority and Windows' efficiency mode, the
+  same as Task Manager's. Everything goes back when the last game closes, when you turn the switch off or when Astra
+  closes, and if Astra is closed mid-game the next start puts them back. Discord, Spotify, Teams and the Steam client
+  itself are never touched, so voice, music and controller input stay smooth. Off by default.
+
+### Changed
+- The Games tab's bottom row now holds three switches: Auto-apply my mode, FPS overlay and Slow background apps.
+
 ## v1.5.0 - 2026-11-15
 
 ### Added
