@@ -916,6 +916,149 @@ VISUAL_MODES = {
 }
 
 
+# --------------------------------------------------------------------------------------
+# NVIDIA driver settings (NVAPI "DRS", the same store the NVIDIA Control Panel edits).
+# IDs and layouts are from NVIDIA's public headers (github.com/NVIDIA/nvapi): nvapi_interface.h,
+# NvApiDriverSettings.h and nvapi.h. Only the global (base) profile is touched.
+# --------------------------------------------------------------------------------------
+
+NVAPI_IDS = {"Initialize": 0x0150E828, "DRS_CreateSession": 0x0694D52E, "DRS_DestroySession": 0xDAD9CFF8,
+             "DRS_LoadSettings": 0x375DBD6B, "DRS_SaveSettings": 0xFCBC7E14, "DRS_GetBaseProfile": 0xDA8466A0,
+             "DRS_GetSetting": 0x73BF8338, "DRS_SetSetting": 0x577DD202, "DRS_DeleteProfileSetting": 0xE4A26362}
+NV_PREFERRED_PSTATE = 0x1057EB71   # "Power management mode": 1 = Prefer maximum performance
+NV_PRERENDER_LIMIT = 0x007BA09E    # "Maximum pre-rendered frames": 1 = Low Latency Mode "On"
+NV_SETTING_NOT_FOUND, NV_INVALID_USER_PRIVILEGE, NV_DEVICE_NOT_FOUND = -160, -137, -6
+NVIDIA_TWEAKS = {
+    "max": [(NV_PREFERRED_PSTATE, 1, "NVIDIA power management", "Prefer maximum performance"),
+            (NV_PRERENDER_LIMIT, 1, "NVIDIA Low Latency Mode", "On")],
+    "cozy": [(NV_PRERENDER_LIMIT, 1, "NVIDIA Low Latency Mode", "On")],
+}
+
+
+class _NvdrsBinary(ctypes.Structure):
+    _fields_ = [("valueLength", ctypes.c_uint32), ("valueData", ctypes.c_uint8 * 4096)]
+
+
+class _NvdrsValue(ctypes.Union):
+    # The classic layout the driver accepts (NVDRS_SETTING_VER1 = 0x13020). Newer nvapi.h adds 64-bit
+    # members to this union, which would make the struct 12328 bytes; current drivers reject that
+    # with NVAPI_INCOMPATIBLE_STRUCT_VERSION (-9), so they're left out on purpose.
+    _fields_ = [("u32", ctypes.c_uint32), ("binary", _NvdrsBinary)]
+
+
+class NVDRS_SETTING(ctypes.Structure):
+    _fields_ = [("version", ctypes.c_uint32), ("settingName", ctypes.c_uint16 * 2048), ("settingId", ctypes.c_uint32),
+                ("settingType", ctypes.c_int), ("settingLocation", ctypes.c_int),
+                ("isCurrentPredefined", ctypes.c_uint32), ("isPredefinedValid", ctypes.c_uint32),
+                ("predefined", _NvdrsValue), ("current", _NvdrsValue)]
+
+
+assert ctypes.sizeof(NVDRS_SETTING) == 12320
+NVDRS_SETTING_VER1 = ctypes.sizeof(NVDRS_SETTING) | (1 << 16)
+NVDRS_DWORD_TYPE = 0
+
+
+class NvidiaError(Exception):
+    def __init__(self, what: str, code: int):
+        reason = {NV_INVALID_USER_PRIVILEGE: "needs administrator rights",
+                  NV_DEVICE_NOT_FOUND: "no NVIDIA graphics card in use"}.get(code, f"NVAPI error {code}")
+        super().__init__(f"{what}: {reason}")
+        self.code = code
+
+
+class NvidiaDrs:
+    """One driver-settings session on the global profile. Use as a context manager."""
+
+    _api: dict | None = None
+
+    @classmethod
+    def _load(cls) -> dict:
+        if cls._api is None:
+            try:
+                dll = ctypes.WinDLL("nvapi64.dll")
+            except OSError as exc:
+                raise NvidiaError("NVIDIA driver", NV_DEVICE_NOT_FOUND) from exc
+            query = dll.nvapi_QueryInterface
+            query.restype, query.argtypes = ctypes.c_void_p, [ctypes.c_uint32]
+            handle, setting = ctypes.c_void_p, ctypes.POINTER(NVDRS_SETTING)
+            signatures = {"Initialize": [], "DRS_CreateSession": [ctypes.POINTER(handle)],
+                          "DRS_DestroySession": [handle], "DRS_LoadSettings": [handle], "DRS_SaveSettings": [handle],
+                          "DRS_GetBaseProfile": [handle, ctypes.POINTER(handle)],
+                          "DRS_GetSetting": [handle, handle, ctypes.c_uint32, setting],
+                          "DRS_SetSetting": [handle, handle, setting],
+                          "DRS_DeleteProfileSetting": [handle, handle, ctypes.c_uint32]}
+            api = {}
+            for name, args in signatures.items():
+                address = query(NVAPI_IDS[name])
+                if not address:
+                    raise NvidiaError(f"NVAPI {name}", -3)
+                api[name] = ctypes.CFUNCTYPE(ctypes.c_int, *args)(address)
+            rc = api["Initialize"]()
+            if rc != 0:
+                raise NvidiaError("NVIDIA driver", rc)
+            cls._api = api
+        return cls._api
+
+    def __init__(self):
+        self.api = self._load()
+        self.session, self.profile = ctypes.c_void_p(), ctypes.c_void_p()
+
+    def _call(self, name: str, *args) -> int:
+        rc = self.api[name](*args)
+        if rc not in (0, NV_SETTING_NOT_FOUND):
+            raise NvidiaError(name.replace("DRS_", ""), rc)
+        return rc
+
+    def __enter__(self) -> "NvidiaDrs":
+        self._call("DRS_CreateSession", ctypes.byref(self.session))
+        try:
+            self._call("DRS_LoadSettings", self.session)
+            self._call("DRS_GetBaseProfile", self.session, ctypes.byref(self.profile))
+        except NvidiaError:
+            self.api["DRS_DestroySession"](self.session)
+            raise
+        return self
+
+    def __exit__(self, *exc) -> None:
+        self.api["DRS_DestroySession"](self.session)
+
+    def get(self, setting_id: int) -> int | None:
+        """The global value the user (or an app like this one) set, or None for the driver default."""
+        setting = NVDRS_SETTING()
+        setting.version = NVDRS_SETTING_VER1
+        if self._call("DRS_GetSetting", self.session, self.profile, setting_id, ctypes.byref(setting)) != 0:
+            return None
+        if setting.isCurrentPredefined or setting.settingType != NVDRS_DWORD_TYPE:
+            return None
+        return int(setting.current.u32)
+
+    def set(self, setting_id: int, value: int) -> None:
+        setting = NVDRS_SETTING()
+        setting.version = NVDRS_SETTING_VER1
+        setting.settingId, setting.settingType = setting_id, NVDRS_DWORD_TYPE
+        setting.current.u32 = value
+        self._call("DRS_SetSetting", self.session, self.profile, ctypes.byref(setting))
+
+    def reset(self, setting_id: int) -> None:
+        self._call("DRS_DeleteProfileSetting", self.session, self.profile, setting_id)
+
+    def save(self) -> None:
+        self._call("DRS_SaveSettings", self.session)
+
+
+def nvidia_pending(profile: str) -> list[str]:
+    """Read-only: which NVIDIA tweaks of a mode would change something now."""
+    wanted = NVIDIA_TWEAKS.get(profile) or []
+    if not wanted:
+        return []
+    try:
+        with NvidiaDrs() as nv:
+            return [f"{label.replace('NVIDIA ', '')} {shown}" for sid, value, label, shown in wanted
+                    if nv.get(sid) != value]
+    except Exception:
+        return []
+
+
 class SystemTweaks:
     def __init__(self, log: RunLog, state: StateStore):
         self.log = log
@@ -1468,6 +1611,7 @@ class SystemTweaks:
             "reg": ("Registry settings", self._undo_reg),
             "spi": ("Visual effects", self._undo_spi),
             "svc": ("Services", self._undo_service),
+            "nvdrs": ("NVIDIA settings", self._undo_nvidia),
         }
         for kind, (title, handler) in handlers.items():
             group = [(key, entry) for key, entry in items if entry.get("kind") == kind]
@@ -1561,6 +1705,9 @@ class SystemTweaks:
             lines.append("Free RAM: trim background apps and clear the standby cache (Medal and your games are skipped)")
             if windowed_games_pending():
                 lines.append("Optimizations for windowed games and variable refresh rate on")
+            nv = nvidia_pending("max")
+            if nv:
+                lines.append("NVIDIA: " + ", ".join(nv))
             lines.append("Flush the DNS cache")
         elif profile == "cozy":
             power("High Performance", "high performance")
@@ -1572,6 +1719,9 @@ class SystemTweaks:
                 lines.append("Game Mode on")
             if windowed_games_pending():
                 lines.append("Optimizations for windowed games and variable refresh rate on")
+            nv = nvidia_pending("cozy")
+            if nv:
+                lines.append("NVIDIA: " + ", ".join(nv))
         else:
             if has_battery():
                 power("Balanced (battery detected)", "balanced")
@@ -1588,6 +1738,44 @@ class SystemTweaks:
         return lines
 
     # ---------------- profiles ----------------
+
+    def apply_nvidia(self, profile: str) -> None:
+        wanted = NVIDIA_TWEAKS.get(profile) or []
+        try:
+            with NvidiaDrs() as nv:
+                changed = False
+                for sid, value, label, shown in wanted:
+                    current = nv.get(sid)
+                    if current == value:
+                        self.log.ok(f"{label}: already {shown}")
+                        continue
+                    key = f"nvdrs:{sid:08X}"
+                    if self.recording and not self.state.snapshot_has(key):
+                        self.state.snapshot_add(key, {"kind": "nvdrs", "id": sid, "label": label, "value": current})
+                    nv.set(sid, value)
+                    changed = True
+                    self.stats["changed"] += 1
+                    self.log.ok(f"{label}: {shown}")
+                if changed:
+                    nv.save()
+        except NvidiaError as exc:
+            if exc.code == NV_DEVICE_NOT_FOUND:
+                self.log.info("No NVIDIA graphics card - driver settings skipped")
+            else:
+                self.log.warn(f"NVIDIA settings not changed: {exc}")
+        except Exception as exc:  # never let a driver call break the rest of the mode
+            self.log.warn(f"NVIDIA settings not changed: {exc.__class__.__name__}: {exc}")
+
+    def _undo_nvidia(self, entry: dict) -> bool:
+        with NvidiaDrs() as nv:
+            if entry.get("value") is None:
+                nv.reset(int(entry["id"]))
+            else:
+                nv.set(int(entry["id"]), int(entry["value"]))
+            nv.save()
+        self.log.ok(f"{entry.get('label', 'NVIDIA setting')}: "
+                    + ("back to the driver default" if entry.get("value") is None else "restored"))
+        return True
 
     def apply_windowed_games(self) -> None:
         """Optimizations for windowed games + VRR for older games (kept in the undo snapshot)."""
@@ -1607,6 +1795,8 @@ class SystemTweaks:
         self.apply_reg_table(GAME_MODE_ON)
         self.log.head("Windowed games")
         self.apply_windowed_games()
+        self.log.head("NVIDIA driver")
+        self.apply_nvidia("max")
         self.log.head("Network")
         self.flush_dns()
         self.log.head("Background services (suspended until reboot)")
@@ -1626,6 +1816,8 @@ class SystemTweaks:
         self.apply_reg_table(GAME_MODE_ON)
         self.log.head("Windowed games")
         self.apply_windowed_games()
+        self.log.head("NVIDIA driver")
+        self.apply_nvidia("cozy")
 
     def profile_quality(self) -> None:
         self.log.head("Power")
@@ -1941,6 +2133,8 @@ MOD_ALT, MOD_CONTROL, MOD_NOREPEAT = 0x0001, 0x0002, 0x4000
 WM_HOTKEY, WM_QUIT = 0x0312, 0x0012
 HOTKEY_LABEL = "Ctrl+Alt+O"
 HOTKEY_VK = ord("O")
+OVERLAY_HOTKEY_LABEL = "Ctrl+Alt+F"
+OVERLAY_HOTKEY_VK = ord("F")
 AUTOSTART_TASK = "Astra Optimizer Autostart"
 LEGACY_AUTOSTART_TASK = "Optimizer Autostart"
 INSTANCE_EVENT = "Local\\AstraOptimizerShowWindow"
@@ -1949,7 +2143,8 @@ SW_RESTORE = 9
 DEFAULT_SETTINGS = {"tray": True, "autostart": False, "hotkey": True, "custom_host": "", "tray_hint": False,
                     "preview": True, "games": [], "game_auto": False, "clean_skip": [], "clean_weekly": False, "clean_at": 0,
                     "dns_original": None,
-                    "restore_point": True, "restore_point_at": 0, "updates": True, "sessions": []}
+                    "restore_point": True, "restore_point_at": 0, "updates": True, "sessions": [],
+                    "overlay": True, "overlay_pos": None}
 
 
 # --------------------------------------------------------------------------------------
@@ -2003,9 +2198,10 @@ def display_tag(tag: str) -> str:
 class HotkeyThread(threading.Thread):
     """Owns a RegisterHotKey registration and its message loop; posts ("hotkey",) to the queue."""
 
-    def __init__(self, out_queue: queue.Queue):
-        super().__init__(name="hotkey", daemon=True)
+    def __init__(self, out_queue: queue.Queue, hotkey_id: int = 1, vk: int = HOTKEY_VK, event: str = "hotkey"):
+        super().__init__(name=event, daemon=True)
         self.out_queue = out_queue
+        self.hotkey_id, self.vk, self.event = hotkey_id, vk, event
         self.ready = threading.Event()
         self.ok = False
         self.thread_id = 0
@@ -2013,16 +2209,16 @@ class HotkeyThread(threading.Thread):
     def run(self) -> None:
         self.thread_id = kernel32.GetCurrentThreadId()
         msg = wintypes.MSG()
-        self.ok = bool(user32.RegisterHotKey(None, 1, MOD_CONTROL | MOD_ALT | MOD_NOREPEAT, HOTKEY_VK))
+        self.ok = bool(user32.RegisterHotKey(None, self.hotkey_id, MOD_CONTROL | MOD_ALT | MOD_NOREPEAT, self.vk))
         self.ready.set()
         if not self.ok:
             return
         try:
             while user32.GetMessageW(ctypes.byref(msg), None, 0, 0) > 0:
                 if msg.message == WM_HOTKEY:
-                    self.out_queue.put(("hotkey",))
+                    self.out_queue.put((self.event,))
         finally:
-            user32.UnregisterHotKey(None, 1)
+            user32.UnregisterHotKey(None, self.hotkey_id)
 
     def stop(self) -> None:
         if self.ok and self.thread_id:
@@ -2155,6 +2351,8 @@ class TrayIcon:
             pystray.MenuItem(lambda item: app.tray_primary_label(), send("toggle"),
                              enabled=lambda item: app.admin and not app.busy),
             pystray.MenuItem("Mode", pystray.Menu(*modes)),
+            pystray.MenuItem(f"Overlay ({OVERLAY_HOTKEY_LABEL})", send("overlay"),
+                             checked=lambda item: app.overlay_visible()),
             pystray.Menu.SEPARATOR,
             pystray.MenuItem(f"Exit {APP_NAME}", send("exit")),
         )
@@ -3687,6 +3885,8 @@ class FrameCapture(threading.Thread):
                                    "--output_stdout", "--no_console_stats", "--session_name", self.session_name,
                                    "--stop_existing_session", "--terminate_on_proc_exit", "--no_track_input"]
         self.stats: dict[tuple, FrameStats] = {}
+        self.recent: dict[tuple, deque] = {}       # last few thousand frame times, for the live overlay
+        self.last_frame: dict[tuple, float] = {}
         self.error: str | None = None
         self.proc: subprocess.Popen | None = None
         self._stopping = False
@@ -3719,7 +3919,10 @@ class FrameCapture(threading.Thread):
                 stats = self.stats.get(key)
                 if stats is None:
                     stats = self.stats[key] = FrameStats()
+                    self.recent[key] = deque(maxlen=2400)
                 stats.add(ms)
+                self.recent[key].append(ms)
+                self.last_frame[key] = time.monotonic()
         except (OSError, ValueError):
             pass
         if not self.stats and not self._stopping:
@@ -3746,6 +3949,27 @@ class FrameCapture(threading.Thread):
         if not self.stats:
             return None
         return max(self.stats.values(), key=lambda st: st.count).summary()
+
+    def live(self) -> tuple[float, float] | None:
+        """(FPS over the last second, 1% low over the last ~2400 frames), or None when the game
+        hasn't drawn anything for 2 s (minimised, loading)."""
+        if not self.stats:
+            return None
+        key = max(self.stats, key=lambda k: self.stats[k].count)
+        if time.monotonic() - self.last_frame.get(key, 0) > 2.0:
+            return None
+        frames = list(self.recent.get(key) or [])
+        if len(frames) < 10:
+            return None
+        total = count = 0
+        for ms in reversed(frames):
+            total += ms
+            count += 1
+            if total >= 1000:
+                break
+        ordered = sorted(frames)
+        slow = ordered[min(len(ordered) - 1, int(len(ordered) * 0.99))]
+        return count * 1000.0 / total, 1000.0 / slow if slow > 0 else 0.0
 
 
 def new_session(exe: str, name: str, now: float | None = None) -> dict:
@@ -3920,6 +4144,9 @@ L_TABLE = (78, 100, 628, 312)
 L_GAME_ROW_Y0, L_GAME_ROW_H, GAME_ROWS = 134, 46, 6
 L_GAME_COLS = {"name": 94, "prio": 466, "fso": 566, "del": 664}
 L_GAME_AUTO = (78, 424, 628, 42)
+L_GAME_SPLIT = 318  # the bottom row holds two switches: game auto mode | overlay
+GAME_AUTO_TEXT = "Apply my mode while a game runs"
+GAME_OVERLAY_TEXT = f"Show the FPS overlay  ·  {OVERLAY_HOTKEY_LABEL}"
 L_HIST_COLS = {"fps": 382, "cpu": 456, "gpu": 522, "temp": 588, "ping": 654}  # centre of each stat column
 L_CMP_COLS = {"a": 438, "b": 540, "chg": 646}  # Compare view: older, newer, change
 COMPARE_METRICS = [  # key, label, hint, unit, which way is better
@@ -4722,6 +4949,98 @@ class ConsoleView:
         self._pin_backdrop()
 
 
+_ov_api = ctypes.WinDLL("user32")  # private function objects for the overlay's window styles
+_ov_api.GetParent.argtypes, _ov_api.GetParent.restype = [wintypes.HWND], wintypes.HWND
+_ov_api.GetWindowLongW.argtypes, _ov_api.GetWindowLongW.restype = [wintypes.HWND, ctypes.c_int], ctypes.c_long
+_ov_api.SetWindowLongW.argtypes, _ov_api.SetWindowLongW.restype = [wintypes.HWND, ctypes.c_int, ctypes.c_long], ctypes.c_long
+GWL_EXSTYLE_I = -20
+WS_EX_TOPMOST_, WS_EX_TOOLWINDOW_, WS_EX_NOACTIVATE_ = 0x00000008, 0x00000080, 0x08000000
+
+
+class OverlayWindow:
+    """Small always-on-top box with live FPS, 1% low, GPU and ping. It never takes focus from the
+    game (WS_EX_NOACTIVATE) and stays off the taskbar. Drag to move, right-click to hide."""
+
+    W, H = 248, 64
+    KEY = "#010203"  # transparent colour, so the box keeps its rounded corners
+
+    def __init__(self, app: "OptimizerApp"):
+        self.app = app
+        px = app.px
+        top = self.top = tk.Toplevel(app)
+        top.withdraw()
+        top.overrideredirect(True)
+        top.configure(bg=self.KEY)
+        top.attributes("-topmost", True)
+        top.attributes("-alpha", 0.94)
+        top.attributes("-transparentcolor", self.KEY)
+        c = self.canvas = tk.Canvas(top, width=px(self.W), height=px(self.H), bg=self.KEY, highlightthickness=0, bd=0)
+        c.pack()
+        panel = app.painter.shape(px(self.W), px(self.H), px(12), fill=rgba(SURFACE, 248),
+                                  border=(255, 255, 255, 46), border_width=1.0)
+        self.photo = ImageTk.PhotoImage(panel)
+        c.create_image(0, 0, anchor="nw", image=self.photo)
+        self.t_fps = c.create_text(px(16), px(28), anchor="w", font=app.f_hero, fill=TEXT_HI, text="–")
+        self.t_unit = c.create_text(px(16), px(51), anchor="w", font=app.f_label, fill=TEXT_MID, text="FPS")
+        self.t_lines = [c.create_text(px(96), px(15 + i * 17), anchor="w", font=app.f_label, fill=TEXT_HI)
+                        for i in range(3)]
+        for seq, handler in (("<ButtonPress-1>", self._press), ("<B1-Motion>", self._drag),
+                             ("<ButtonRelease-1>", self._release), ("<Button-3>", lambda _e: app._toggle_overlay(False))):
+            c.bind(seq, handler)
+        self._grab = (0, 0)
+        self.visible = False
+        pos = app._setting("overlay_pos")
+        x, y = (pos if isinstance(pos, list) and len(pos) == 2 else (px(24), px(24)))
+        top.geometry(f"+{int(x)}+{int(y)}")
+        top.update_idletasks()
+        try:  # no focus stealing, no taskbar button
+            hwnd = _ov_api.GetParent(top.winfo_id()) or top.winfo_id()
+            style = _ov_api.GetWindowLongW(hwnd, GWL_EXSTYLE_I)
+            _ov_api.SetWindowLongW(hwnd, GWL_EXSTYLE_I, style | WS_EX_TOPMOST_ | WS_EX_TOOLWINDOW_ | WS_EX_NOACTIVATE_)
+        except Exception:
+            pass
+
+    def _press(self, event) -> None:
+        self._grab = (event.x_root - self.top.winfo_x(), event.y_root - self.top.winfo_y())
+
+    def _drag(self, event) -> None:
+        self.top.geometry(f"+{event.x_root - self._grab[0]}+{event.y_root - self._grab[1]}")
+
+    def _release(self, _event) -> None:
+        self.app._set_setting("overlay_pos", [self.top.winfo_x(), self.top.winfo_y()])
+
+    def show(self) -> None:
+        self.top.deiconify()
+        self.top.attributes("-topmost", True)
+        self.top.lift()
+        self.visible = True
+
+    def hide(self) -> None:
+        self.top.withdraw()
+        self.visible = False
+
+    def update(self, data: dict) -> None:
+        c = self.canvas
+        fps, low = data.get("fps"), data.get("low")
+        c.itemconfigure(self.t_fps, text="–" if fps is None else f"{fps:.0f}")
+        temp, load, cpu, ping = data.get("gpu_temp"), data.get("gpu_load"), data.get("cpu"), data.get("ping")
+        gpu = "GPU  –" if load is None else f"GPU  {load:.0f}%"
+        if temp is not None:
+            gpu += f"  ·  {temp:.0f} °C"
+        last = "CPU  –" if cpu is None else f"CPU  {cpu:.0f}%"
+        if ping is not None:
+            last += f"  ·  Ping {ping:.0f} ms"
+        lines = ["1% low  –" if low is None else f"1% low  {low:.0f}", gpu, last]
+        for item, text in zip(self.t_lines, lines):
+            c.itemconfigure(item, text=text)
+
+    def destroy(self) -> None:
+        try:
+            self.top.destroy()
+        except tk.TclError:
+            pass
+
+
 class _HostValue:
     """get()/set() for the custom-server text, like the StringVar it replaced."""
 
@@ -4845,6 +5164,11 @@ class OptimizerApp(ctk.CTk):
         self.tab = "boost"
         self.tray: TrayIcon | None = None
         self.hotkey: HotkeyThread | None = None
+        self.overlay_hotkey: HotkeyThread | None = None
+        self.overlay: OverlayWindow | None = None
+        self._overlay_auto = False   # shown because a game started (hidden again when it ends)
+        self._last_tel: dict = {}
+        self._last_ping: float | None = None
         self._start_hidden = start_hidden
         self._job_origin: str | None = None
         self._last_summary: tuple[str, list[str]] | None = None
@@ -5588,8 +5912,9 @@ class OptimizerApp(ctk.CTk):
                                                 "It gets high CPU priority every time it runs.")
         ax, ay, aw, ah = L_GAME_AUTO
         self.t_game_auto = c.create_text(px(ax + 76), px(ay + ah / 2), anchor="w", font=self.f_desc, fill=TEXT_HI,
-                                         tags=g, text="Apply the selected mode while a game runs, and undo it when "
-                                                      "the game closes")
+                                         tags=g, text=GAME_AUTO_TEXT)
+        self.t_game_overlay = c.create_text(px(ax + L_GAME_SPLIT + 58), px(ay + ah / 2), anchor="w", font=self.f_desc,
+                                            fill=TEXT_HI, tags=g, text=GAME_OVERLAY_TEXT)
 
         # Startup apps
         st = tags["startup"]
@@ -6251,6 +6576,7 @@ class OptimizerApp(ctk.CTk):
                 toggle(f"find:{index}", items[index]["pick"], L_GAME_COLS["prio"], L_GAME_ROW_Y0 + i * L_GAME_ROW_H + 10)
             ax, ay, aw, ah = L_GAME_AUTO
             toggle("game:auto", bool(self._setting("game_auto")), ax + 18, ay + (ah - th) / 2)
+            toggle("game:overlay", bool(self._setting("overlay")), ax + L_GAME_SPLIT, ay + (ah - th) / 2)
         elif self.tool_page == "dns":
             current = set(self.dns_info["servers"]) if self.dns_info else set()
             for i, row in enumerate(self.dns_rows):
@@ -6285,6 +6611,7 @@ class OptimizerApp(ctk.CTk):
                 paste_layer(scene, img, px(L_GAME_COLS["del"]), px(ry + 10))
             ax, ay, aw, ah = L_GAME_AUTO
             toggle("game:auto", bool(self._setting("game_auto")), ax + 18, ay + (ah - th) / 2)
+            toggle("game:overlay", bool(self._setting("overlay")), ax + L_GAME_SPLIT, ay + (ah - th) / 2)
         elif self.tool_page == "startup" and self.startup_items:
             for i in range(min(START_ROWS, len(self.startup_items) - self.startup_offset)):
                 index = self.startup_offset + i
@@ -6472,7 +6799,7 @@ class OptimizerApp(ctk.CTk):
                     if inside((L_TABLE[0] + 6, ry - 2, L_TABLE[2] - 12, L_GAME_ROW_H)):
                         return f"find:{self.game_offset + i}"
                 if inside(L_GAME_AUTO):
-                    return "game:auto"
+                    return "game:auto" if lx < L_GAME_AUTO[0] + L_GAME_SPLIT - 8 else "game:overlay"
             elif self.tool_page == "dns":
                 current = set(self.dns_info["servers"]) if self.dns_info else set()
                 for i, row in enumerate(self.dns_rows):
@@ -6495,7 +6822,7 @@ class OptimizerApp(ctk.CTk):
                             and self._last_session(self.games[index]["path"]):
                         return f"game:report:{index}"
                 if inside(L_GAME_AUTO):
-                    return "game:auto"
+                    return "game:auto" if lx < L_GAME_AUTO[0] + L_GAME_SPLIT - 8 else "game:overlay"
             elif self.tool_page == "startup" and self.startup_items:
                 for i in range(min(START_ROWS, len(self.startup_items) - self.startup_offset)):
                     ry = L_START_ROW_Y0 + i * L_START_ROW_H
@@ -7269,8 +7596,12 @@ class OptimizerApp(ctk.CTk):
                 elif kind == "gpu-setup":
                     self.gpu_setup = event[1]
                 elif kind == "session-ping":
+                    if event[1] is not None:
+                        self._last_ping = event[1]
                     for session in self.sessions_live.values():
                         session["pings"].append(event[1])
+                elif kind == "overlay-hotkey":
+                    self._toggle_overlay()
                 elif kind == "game-start":
                     self._on_game_start(*event[1:])
                 elif kind == "game-stop":
@@ -7372,6 +7703,7 @@ class OptimizerApp(ctk.CTk):
             self._schedule_update_check(4000)  # after startup has settled
         self.after(90 * 1000, self._weekly_cleanup_tick)
         self._detect_gpu_setup()
+        self._start_overlay_hotkey()
 
     def _start_tray(self) -> bool:
         if self.tray is not None:
@@ -7391,6 +7723,53 @@ class OptimizerApp(ctk.CTk):
         if self.tray is not None:
             self.tray.stop()
             self.tray = None
+
+    def overlay_visible(self) -> bool:
+        return self.overlay is not None and self.overlay.visible
+
+    def _toggle_overlay(self, show: bool | None = None, auto: bool = False) -> None:
+        show = (not self.overlay_visible()) if show is None else show
+        if show == self.overlay_visible():
+            if show and not auto:
+                self._overlay_auto = False  # asked for by hand: keep it after the game closes
+            return
+        if show:
+            if self.overlay is None:
+                self.overlay = OverlayWindow(self)
+            self.overlay.update(self._overlay_data())
+            self.overlay.show()
+            self._overlay_auto = auto
+            self.after(500, self._overlay_tick)
+        elif self.overlay is not None:
+            self.overlay.hide()
+            self._overlay_auto = False
+        self._tray_refresh()
+
+    def _overlay_data(self) -> dict:
+        live = None
+        for session in self.sessions_live.values():
+            capture = session.get("capture")
+            if capture is not None:
+                live = capture.live() or live
+        gpu = self._last_tel.get("gpu") or {}
+        return {"fps": live[0] if live else None, "low": live[1] if live else None,
+                "gpu_temp": gpu.get("temp"), "gpu_load": gpu.get("load"), "cpu": self._last_tel.get("cpu"),
+                "ping": self._last_ping if self.sessions_live else None}
+
+    def _overlay_tick(self) -> None:
+        if self._closing or not self.overlay_visible():
+            return
+        self.overlay.update(self._overlay_data())
+        self.after(500, self._overlay_tick)
+
+    def _start_overlay_hotkey(self) -> None:
+        hotkey = HotkeyThread(self.events, 2, OVERLAY_HOTKEY_VK, "overlay-hotkey")
+        hotkey.start()
+        hotkey.ready.wait(2.0)
+        if hotkey.ok:
+            self.overlay_hotkey = hotkey
+        else:
+            self._emit("warn", f"{OVERLAY_HOTKEY_LABEL} is already taken by another app; use the tray menu for the overlay")
 
     def _start_hotkey(self) -> bool:
         if self.hotkey is not None:
@@ -7457,6 +7836,8 @@ class OptimizerApp(ctk.CTk):
             self._quick_toggle("tray")
         elif action == "exit":
             self._quit()
+        elif action == "overlay":
+            self._toggle_overlay()
         elif action.startswith("profile:"):
             self._select_profile(action.partition(":")[2])
 
@@ -7784,6 +8165,17 @@ class OptimizerApp(ctk.CTk):
         self._render()
 
     def _game_action(self, what: str, index: int) -> None:
+        if what == "overlay":
+            on = not self._setting("overlay")
+            self._set_setting("overlay", on)
+            if on and self.sessions_live:
+                self._toggle_overlay(True, auto=True)
+            elif not on and self._overlay_auto:
+                self._toggle_overlay(False)
+            self._emit("ok", f"The FPS overlay will show while a game runs ({OVERLAY_HOTKEY_LABEL} toggles it any time)"
+                       if on else f"The overlay no longer opens by itself; {OVERLAY_HOTKEY_LABEL} still shows it")
+            self._render()
+            return
         if what == "auto":
             on = not self._setting("game_auto")
             self._set_setting("game_auto", on)
@@ -8128,6 +8520,8 @@ class OptimizerApp(ctk.CTk):
             capture = FrameCapture(os.path.basename(exe))
             capture.start()
             session["capture"] = capture
+        if self._setting("overlay"):
+            self._toggle_overlay(True, auto=True)
         if self.session_pinger is None:
             self.session_pinger = SessionPinger(self.events)
             self.session_pinger.start()
@@ -8137,6 +8531,10 @@ class OptimizerApp(ctk.CTk):
         if not self.sessions_live and self.session_pinger is not None:
             self.session_pinger.stop_event.set()
             self.session_pinger = None
+        if not self.sessions_live:
+            self._last_ping = None
+            if self._overlay_auto:
+                self._toggle_overlay(False)
         if session is None:
             return
         capture = session.pop("capture", None)
@@ -8239,6 +8637,7 @@ class OptimizerApp(ctk.CTk):
             summary = f"Pick two sessions to compare ({len(self.compare_pick)} of 2 picked)"
         else:
             summary = self._history_summary(sessions)
+        c.itemconfigure(self.t_game_overlay, text="")
         c.itemconfigure(self.t_game_auto, text=self._fit(summary, self.f_desc, aw - 36))
 
     def _clear_compare_texts(self) -> None:
@@ -8308,6 +8707,7 @@ class OptimizerApp(ctk.CTk):
         c.itemconfigure(self.t_games_empty, text="")
         ax, ay, aw, ah = L_GAME_AUTO
         c.coords(self.t_game_auto, self.px(ax + 18), self.px(ay + ah / 2))
+        c.itemconfigure(self.t_game_overlay, text="")
         c.itemconfigure(self.t_game_auto, text=self._fit(self._compare_note(old, new), self.f_desc, aw - 36))
 
     @staticmethod
@@ -8378,8 +8778,8 @@ class OptimizerApp(ctk.CTk):
             c.itemconfigure(self.t_game_heads[col], text="")
         ax, ay, aw, ah = L_GAME_AUTO
         c.coords(self.t_game_auto, self.px(ax + 76), self.px(ay + ah / 2))
-        c.itemconfigure(self.t_game_auto, text="Apply the selected mode while a game runs, and undo it when the "
-                                               "game closes")
+        c.itemconfigure(self.t_game_auto, text=GAME_AUTO_TEXT)
+        c.itemconfigure(self.t_game_overlay, text=GAME_OVERLAY_TEXT)
         c.itemconfigure(self.t_buttons["findgames"], text="Cancel" if finder else "Find games")
         if finder:
             items = finder.get("items", [])
@@ -9182,6 +9582,7 @@ class OptimizerApp(ctk.CTk):
             self.canvas.itemconfigure(rect, fill=color)
 
     def _update_telemetry(self, data: dict) -> None:
+        self._last_tel = data
         for session in self.sessions_live.values():
             add_session_sample(session, data)
         cpu = float(data["cpu"])
@@ -9263,6 +9664,10 @@ class OptimizerApp(ctk.CTk):
         if self.game_watcher is not None:
             self.game_watcher.stop_event.set()
         self._stop_hotkey()
+        if self.overlay_hotkey is not None:
+            self.overlay_hotkey.stop()
+        if self.overlay is not None:
+            self.overlay.destroy()
         self._stop_tray()
         self.destroy()
 
