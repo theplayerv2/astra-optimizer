@@ -3283,12 +3283,76 @@ def privacy_restore(key: str, saved: list | None) -> None:
 
 
 # --------------------------------------------------------------------------------------
+# Settings backup: one JSON file with settings, games, appearance (custom picture included)
+# and session history. Things tied to this PC or to Windows' own state stay out of it.
+# --------------------------------------------------------------------------------------
+
+BACKUP_FORMAT = 1
+BACKUP_SKIP = {"autostart", "dns_original", "restore_point_at", "tray_hint", "clean_at"}
+
+
+def plural(count: int, word: str) -> str:
+    return f"{count} {word}{'' if count == 1 else 's'}"
+
+
+def make_backup(settings: dict, background_path: str | None) -> dict:
+    import base64
+    data = {"astra_backup": BACKUP_FORMAT, "app_version": APP_VERSION,
+            "created": _dt.datetime.now().isoformat(timespec="seconds"),
+            "settings": {k: v for k, v in settings.items() if k not in BACKUP_SKIP}}
+    look = settings.get("appearance") or {}
+    if look.get("background") == "image" and background_path and os.path.isfile(background_path):
+        with open(background_path, "rb") as handle:
+            data["background_jpg"] = base64.b64encode(handle.read()).decode("ascii")
+    return data
+
+
+def read_backup(path: str) -> dict:
+    """Parsed and checked backup; raises ValueError with a plain reason when it isn't one."""
+    try:
+        with open(path, encoding="utf-8") as handle:
+            data = json.load(handle)
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise ValueError(f"couldn't read it ({exc.__class__.__name__})") from exc
+    if not isinstance(data, dict) or data.get("astra_backup") is None or not isinstance(data.get("settings"), dict):
+        raise ValueError("it isn't an Astra Optimizer backup")
+    if int(data.get("astra_backup") or 0) > BACKUP_FORMAT:
+        raise ValueError("it was made by a newer version of Astra Optimizer")
+    return data
+
+
+def merge_backup(current: dict, backup: dict) -> dict:
+    """Current settings with the backup's known keys laid over them (unknown or PC-specific keys
+    are ignored, and values of the wrong type are dropped)."""
+    merged = dict(current)
+    for key, value in backup.get("settings", {}).items():
+        if key in BACKUP_SKIP or (key not in DEFAULT_SETTINGS and key != "appearance"):
+            continue
+        default = DEFAULT_SETTINGS.get(key)
+        if key == "appearance" and not isinstance(value, dict):
+            continue
+        if isinstance(default, bool) and not isinstance(value, bool):
+            continue
+        if isinstance(default, list) and not isinstance(value, list):
+            continue
+        merged[key] = value
+    games = []
+    for game in merged.get("games") or []:
+        if isinstance(game, dict) and isinstance(game.get("path"), str):
+            games.append({k: v for k, v in game.items() if not str(k).startswith("_")})
+    merged["games"] = games
+    merged["sessions"] = [r for r in merged.get("sessions") or []
+                          if isinstance(r, dict) and {"exe", "start", "end", "cpu_avg"} <= set(r)][-SESSION_KEEP:]
+    return merged
+
+
+# --------------------------------------------------------------------------------------
 # Game session reports
 # --------------------------------------------------------------------------------------
 
 SESSION_MIN_SECONDS = 60
 SESSION_PING_HOST = "1.1.1.1"
-SESSION_KEEP = 40
+SESSION_KEEP = 100
 
 
 class SessionPinger(threading.Thread):
@@ -3469,6 +3533,7 @@ L_TABLE = (78, 100, 628, 312)
 L_GAME_ROW_Y0, L_GAME_ROW_H, GAME_ROWS = 134, 46, 6
 L_GAME_COLS = {"name": 94, "prio": 466, "fso": 566, "del": 664}
 L_GAME_AUTO = (78, 424, 628, 42)
+L_HIST_COLS = {"cpu": 404, "gpu": 486, "temp": 568, "ping": 648}  # centre of each stat column
 L_START_ROW_Y0, L_START_ROW_H, START_ROWS = 134, 39, 7
 L_START_COLS = {"name": 94, "source": 446, "toggle": 646}
 L_CLEAN_ROWS = {key: (78, 100 + i * 48, 628, 44)
@@ -3484,7 +3549,8 @@ L_SETTING_ROWS = {key: (78, 96 + i * 53, 628, 48)
 L_SETTING_TEXT_Y = (6, 26)  # title and description offsets inside a row
 L_TOGGLE = (44, 24)
 L_FOLDER_ROW = (78, 416, 628, 46)
-L_SETTING_BUTTONS = {"folder": (78 + 628 - 16 - 120, 416 + 4, 120, 38)}
+L_SETTING_BUTTONS = {"backup": (386, 420, 92, 38), "restore": (486, 420, 92, 38), "folder": (586, 420, 104, 38)}
+SETTING_BUTTON_TEXT = {"backup": "Back up…", "restore": "Restore…", "folder": "Open folder"}
 L_PROTECT_BUTTON = (78 + 628 - 20 - 44 - 16 - 104, L_SETTING_ROWS["restore"][1] + 9, 104, 30)  # "Turn on…"
 L_DIALOG_W = 404
 # Privacy tab (same row geometry as Settings)
@@ -4324,6 +4390,7 @@ class OptimizerApp(ctk.CTk):
         self.checkup: dict[str, dict] = {}
         self.checkup_at = 0.0
         self.sessions_live: dict[str, dict] = {}
+        self.session_view: str | None = None  # a game's path while its session history is shown
         self.privacy_state: dict[str, bool] = {}
         self._privacy_busy = False
         self._privacy_defaults: list = []
@@ -4957,12 +5024,12 @@ class OptimizerApp(ctk.CTk):
         self.t_buttons["protect"] = c.create_text(px(bx + bw / 2), px(by + bh / 2), text="Turn on…",
                                                   font=self.f_ghost_small, fill=TEXT_HI, tags=(*settings, "protect-btn"))
         x, y, w, h = L_FOLDER_ROW
-        c.create_text(px(x + 20), px(y + 5), anchor="nw", text="Logs and undo data", font=self.f_title,
+        c.create_text(px(x + 20), px(y + 5), anchor="nw", text="Your data", font=self.f_title,
                       fill=TEXT_HI, tags=settings)
         c.create_text(px(x + 20), px(y + 25), anchor="nw", text=STATE_DIR,
                       font=self.f_mono, fill=TEXT_MID, tags=settings)
         for key, (bx, by, bw, bh) in L_SETTING_BUTTONS.items():
-            self.t_buttons[key] = c.create_text(px(bx + bw / 2), px(by + bh / 2), text="Open folder",
+            self.t_buttons[key] = c.create_text(px(bx + bw / 2), px(by + bh / 2), text=SETTING_BUTTON_TEXT[key],
                                                 font=self.f_ghost, fill=TEXT_HI, tags=settings)
 
         # ---- Privacy tab ----
@@ -5097,6 +5164,8 @@ class OptimizerApp(ctk.CTk):
         for col, label in (("prio", "HIGH PRIORITY"), ("fso", "FULLSCREEN OPT. OFF")):
             self.t_game_heads[col] = c.create_text(px(L_GAME_COLS[col] + 22), px(head_y), anchor="n", text=label,
                                                    font=self.f_label, fill=ASH, tags=g)
+        for col, cx in L_HIST_COLS.items():
+            self.t_game_heads[col] = c.create_text(px(cx), px(head_y), anchor="n", font=self.f_label, fill=ASH, tags=g)
         self.t_games = []
         for i in range(GAME_ROWS):
             ry = L_GAME_ROW_Y0 + i * L_GAME_ROW_H
@@ -5105,6 +5174,8 @@ class OptimizerApp(ctk.CTk):
                                       fill=TEXT_HI, tags=g),
                 "sub": c.create_text(px(L_GAME_COLS["name"]), px(ry + 23), anchor="nw", font=self.f_label,
                                      fill=TEXT_MID, tags=g),
+                **{col: c.create_text(px(cx), px(ry + 12), anchor="n", font=self.f_plan, fill=TEXT_HI, tags=g)
+                   for col, cx in L_HIST_COLS.items()},
             })
         tx, ty, tw, th = L_TABLE
         self.t_games_empty = c.create_text(px(tx + tw / 2), px(ty + th / 2 + 10), font=self.f_desc, fill=TEXT_MID,
@@ -5447,6 +5518,8 @@ class OptimizerApp(ctk.CTk):
                 and bool((self.checkup.get(key) or {}).get("action"))
         if key == "checkup":
             return tools_page == "checkup" and self.checkup_state == "idle"
+        if kind == "hist":
+            return tools_page == "games" and bool(self.session_view)
         if kind == "game":
             return tools_page == "games"
         if kind == "startup":
@@ -5477,7 +5550,7 @@ class OptimizerApp(ctk.CTk):
             return tools_page == "startup"
         if key == "clean":
             return tools_page == "cleanup" and self.clean_state == "idle" and self._clean_total()[1] > 0
-        if key == "folder":
+        if key in ("folder", "backup", "restore"):
             return self.tab == "settings"
         if key == "profile":
             return self.tab == "about"
@@ -5673,7 +5746,8 @@ class OptimizerApp(ctk.CTk):
                     tw, th = L_TOGGLE
                     img = self._cached(("toggle", on, state), lambda: self.painter.toggle(px(tw), px(th), on, state))
                     paste_layer(scene, img, px(x + w - 20 - tw), px(y + (h - th) / 2))
-                self._render_ghost(scene, "folder", L_SETTING_BUTTONS["folder"])
+                for key, rect in L_SETTING_BUTTONS.items():
+                    self._render_ghost(scene, key, rect)
                 if self.protection is False and self.admin:
                     self._render_ghost(scene, "protect", L_PROTECT_BUTTON)
 
@@ -5708,6 +5782,8 @@ class OptimizerApp(ctk.CTk):
         px = self.px
         self._render_segment(scene, "tool", TOOL_PAGES)
         for key, rect in TOOL_PAGE_BUTTONS[self.tool_page].items():
+            if key == "addgame" and self.session_view and not self.game_finder:
+                continue
             if key in PRIMARY_TOOL_BUTTONS or (key == "addgame" and self.game_finder):
                 self._render_primary(scene, key, rect)
             else:
@@ -5770,6 +5846,8 @@ class OptimizerApp(ctk.CTk):
                 paste_layer(scene, img, px(L_DNS_COLS["use"]), px(L_DNS_ROW_Y0 + i * L_DNS_ROW_H + 5))
             if self.settings_dns_original():
                 self._render_ghost(scene, "dnsrestore", L_DNS_RESTORE)
+        elif self.tool_page == "games" and self.session_view:
+            pass
         elif self.tool_page == "games":
             for i in range(min(GAME_ROWS, len(self.games) - self.game_offset)):
                 index = self.game_offset + i
@@ -5942,8 +6020,17 @@ class OptimizerApp(ctk.CTk):
                 index = min(len(TOOL_PAGES) - 1, max(0, int((lx - x) / (w / len(TOOL_PAGES)))))
                 return f"seg:tool:{TOOL_PAGES[index][0]}"
             for key, rect in TOOL_PAGE_BUTTONS[self.tool_page].items():
+                if key == "addgame" and self.session_view and not self.game_finder:
+                    continue
                 if inside(rect):
                     return f"btn:{key}"
+            if self.tool_page == "games" and self.session_view and not self.game_finder:
+                sessions = self._game_sessions(self.session_view)
+                for i in range(min(GAME_ROWS, len(sessions) - self.game_offset)):
+                    ry = L_GAME_ROW_Y0 + i * L_GAME_ROW_H
+                    if inside((L_TABLE[0] + 6, ry - 2, L_TABLE[2] - 12, L_GAME_ROW_H)):
+                        return f"hist:{self.game_offset + i}"
+                return None
             if self.tool_page == "ping" and inside(L_PING_HOST_FIELD):
                 return "host:field"
             if self.tool_page == "checkup":
@@ -6197,6 +6284,10 @@ class OptimizerApp(ctk.CTk):
             self._use_custom_host()
         elif target == "btn:folder":
             self._open_state_folder()
+        elif target == "btn:backup":
+            self._export_backup()
+        elif target == "btn:restore":
+            self._import_backup()
         elif target == "btn:profile":
             self._open_link(CREDIT_URL)
         elif target == "btn:update":
@@ -6211,6 +6302,10 @@ class OptimizerApp(ctk.CTk):
             self._game_action(what, int(index) if index else -1)
         elif kind == "chk":
             self._checkup_action(key)
+        elif kind == "hist":
+            sessions = self._game_sessions(self.session_view or "")
+            if 0 <= int(key) < len(sessions):
+                self._show_session_report(sessions[int(key)])
         elif kind == "priv":
             self._toggle_privacy([key], not self.privacy_state.get(key, False))
         elif target == "btn:privall":
@@ -6435,7 +6530,12 @@ class OptimizerApp(ctk.CTk):
             return
         step = -1 if event.delta > 0 else 1
         if self.tool_page == "games":
-            total = len(self.game_finder.get("items", [])) if self.game_finder else len(self.games)
+            if self.game_finder:
+                total = len(self.game_finder.get("items", []))
+            elif self.session_view:
+                total = len(self._game_sessions(self.session_view))
+            else:
+                total = len(self.games)
             self.game_offset = max(0, min(max(0, total - GAME_ROWS), self.game_offset + step))
             self._paint_games()
         else:
@@ -7099,6 +7199,88 @@ class OptimizerApp(ctk.CTk):
                 self._emit("ok", f"{APP_NAME} {DISPLAY_VERSION} is the latest version")
         self._refresh_update_ui()
 
+    # ---------------- settings backup ----------------
+
+    def _export_backup(self) -> None:
+        stamp = _dt.date.today().isoformat()
+        path = filedialog.asksaveasfilename(parent=self, title="Back up Astra Optimizer settings",
+                                            initialfile=f"Astra Optimizer backup {stamp}.json",
+                                            defaultextension=".json", filetypes=[("Backup", "*.json")])
+        if not path:
+            return
+        try:
+            data = make_backup(dict(self.state_store.get("settings") or {}), self._bg_path())
+            with open(path, "w", encoding="utf-8") as handle:
+                json.dump(data, handle, indent=1)
+        except (OSError, TypeError, ValueError) as exc:
+            self._emit("fail", f"Couldn't save the backup: {exc}")
+            return
+        games, sessions = len(data["settings"].get("games") or []), len(data["settings"].get("sessions") or [])
+        self._emit("ok", f"Backup saved to {path} ({plural(games, 'game')}, {plural(sessions, 'session')})")
+
+    def _import_backup(self) -> None:
+        path = filedialog.askopenfilename(parent=self, title="Restore Astra Optimizer settings",
+                                          filetypes=[("Backup", "*.json"), ("All files", "*.*")])
+        if not path:
+            return
+        try:
+            data = read_backup(path)
+        except ValueError as exc:
+            self._emit("fail", f"Couldn't restore {os.path.basename(path)}: {exc}")
+            return
+        try:
+            created = _dt.datetime.fromisoformat(str(data.get("created")))
+            when = f"from {created.strftime('%b')} {created.day}, {created.year}"
+        except ValueError:
+            when = os.path.basename(path)
+        games, sessions = len(data["settings"].get("games") or []), len(data["settings"].get("sessions") or [])
+        self._open_dialog(f"Restore the backup {when}?",
+                          f"Your settings, games list ({plural(games, 'game')} in the backup), appearance and "
+                          f"session history ({plural(sessions, 'session')}) are replaced with the backup's. Changes Astra made to Windows, and the "
+                          "Privacy switches, stay as they are.",
+                          "Restore", lambda: self._apply_backup(data))
+
+    def _apply_backup(self, data: dict) -> None:
+        import base64
+        merged = merge_backup(dict(self.state_store.get("settings") or {}), data)
+        if data.get("background_jpg") and (merged.get("appearance") or {}).get("background") == "image":
+            try:
+                raw = base64.b64decode(data["background_jpg"], validate=True)
+                Image.open(__import__("io").BytesIO(raw)).verify()
+                os.makedirs(os.path.dirname(self._bg_path()), exist_ok=True)
+                with open(self._bg_path(), "wb") as handle:
+                    handle.write(raw)
+            except Exception:
+                merged["appearance"] = dict(merged["appearance"], background="stars")
+        self.state_store.set("settings", merged)
+        # Bring everything running in line with the restored settings.
+        self.game_finder, self.session_view, self.game_offset = None, None, 0
+        self.games = list(merged["games"])
+        self._save_games()
+        self.look = self._load_look()
+        self._bg_version += 1
+        if merged.get("tray") and (self.tray is None or not self.tray.running):
+            self._start_tray()
+        elif not merged.get("tray") and self.tray is not None:
+            self._stop_tray()
+        if merged.get("hotkey") and self.hotkey is None:
+            self._start_hotkey()
+        elif not merged.get("hotkey") and self.hotkey is not None:
+            self._stop_hotkey()
+        self._schedule_update_check(5000 if merged.get("updates") else None)
+        self.host_value = merged.get("custom_host") or ""
+        self.host_cursor = len(self.host_value)
+        for row in self.ping_rows:
+            if row["key"] == "custom":
+                row["host"] = self.host_value or None
+        self._paint_host()
+        self._paint_games()
+        self._paint_cleanup()
+        self._tray_refresh()
+        self._apply_look(fade=True)
+        self._emit("ok", f"Backup restored: {plural(len(self.games), 'game')}, "
+                         f"{plural(len(merged['sessions']), 'session')}")
+
     def _open_link(self, url: str) -> None:
         """Open in the user's browser. Going through Explorer keeps the browser out of the
         elevated (administrator) session this app runs in."""
@@ -7172,9 +7354,8 @@ class OptimizerApp(ctk.CTk):
         game = self.games[index]
         name, path = game.get("name") or os.path.basename(game["path"]), game["path"]
         if what == "report":
-            report = self._last_session(path)
-            if report:
-                self._show_session_report(report)
+            if self._last_session(path):
+                self._open_session_history(path)
             return
         if what == "prio":
             game["priority"] = not game.get("priority", True)
@@ -7433,9 +7614,91 @@ class OptimizerApp(ctk.CTk):
         except tk.TclError:
             return False
 
+    def _game_sessions(self, path: str) -> list[dict]:
+        """This game's saved sessions, newest first."""
+        exe = os.path.normcase(path)
+        return [r for r in reversed(self._setting("sessions") or []) if os.path.normcase(r.get("exe", "")) == exe]
+
+    def _open_session_history(self, path: str) -> None:
+        self.session_view, self.game_offset = path, 0
+        self._paint_games()
+        self.canvas.configure(cursor="hand2" if self._enabled(self.hover) else "")
+        self._render()
+
+    def _close_session_history(self) -> None:
+        self.session_view, self.game_offset = None, 0
+        self._paint_games()
+        self._render()
+
+    def _paint_session_history(self) -> None:
+        c = self.canvas
+        path = self.session_view
+        sessions = self._game_sessions(path)
+        name = self._game_name(os.path.normcase(path))
+        c.itemconfigure(self.t_buttons["findgames"], text="Back")
+        c.itemconfigure(self.t_buttons["addgame"], text="")
+        c.itemconfigure(self.t_game_heads["name"], text=self._fit(f"{name.upper()}  ·  {len(sessions)} SESSIONS",
+                                                                  self.f_label, 280))
+        for col in ("prio", "fso"):
+            c.itemconfigure(self.t_game_heads[col], text="")
+        for col, label in (("cpu", "CPU AVG"), ("gpu", "GPU AVG"), ("temp", "HOTTEST"), ("ping", "PING")):
+            c.itemconfigure(self.t_game_heads[col], text=label)
+        for i, row in enumerate(self.t_games):
+            index = self.game_offset + i
+            if index >= len(sessions):
+                for item in row.values():
+                    c.itemconfigure(item, text="")
+                continue
+            r = sessions[index]
+            when = format_day(r["end"])
+            c.itemconfigure(row["name"], text=f"{when[:1].upper()}{when[1:]}, {format_clock(r['start'])}",
+                            fill=TEXT_HI)
+            c.itemconfigure(row["sub"], text=format_duration(r["end"] - r["start"]), fill=TEXT_MID)
+            hot = (r.get("temp_peak") or 0) >= 85
+            lossy = (r.get("ping_loss") or 0) >= 2 or (r.get("ping_spikes") or 0) >= 5
+            c.itemconfigure(row["cpu"], text=f"{r['cpu_avg']:.0f}%", fill=TEXT_HI)
+            c.itemconfigure(row["gpu"], text="–" if r.get("gpu_avg") is None else f"{r['gpu_avg']:.0f}%", fill=TEXT_HI)
+            c.itemconfigure(row["temp"], text="–" if r.get("temp_peak") is None else f"{r['temp_peak']:.0f} °C",
+                            fill=WARN_YELLOW if hot else TEXT_HI)
+            c.itemconfigure(row["ping"], text="–" if r.get("ping_avg") is None else f"{r['ping_avg']:.0f} ms",
+                            fill=WARN_YELLOW if lossy else TEXT_HI)
+        c.itemconfigure(self.t_games_empty, text="" if sessions else "No sessions saved for this game yet.")
+        ax, ay, aw, ah = L_GAME_AUTO
+        c.coords(self.t_game_auto, self.px(ax + 18), self.px(ay + ah / 2))  # no switch in this view
+        c.itemconfigure(self.t_game_auto, text=self._fit(self._history_summary(sessions), self.f_desc, aw - 36))
+
+    @staticmethod
+    def _history_summary(sessions: list[dict]) -> str:
+        if not sessions:
+            return ""
+        played = sum(r["end"] - r["start"] for r in sessions)
+        parts = [f"{len(sessions)} session{'s' if len(sessions) != 1 else ''}, {format_duration(played)} played"]
+        gpu = [r["gpu_avg"] for r in sessions if r.get("gpu_avg") is not None]
+        temps = [r["temp_peak"] for r in sessions if r.get("temp_peak") is not None]
+        pings = [r["ping_avg"] for r in sessions if r.get("ping_avg") is not None]
+        if gpu:
+            parts.append(f"GPU {sum(gpu) / len(gpu):.0f}% on average")
+        if temps:
+            parts.append(f"hottest {max(temps):.0f} °C")
+        if pings:
+            parts.append(f"ping {sum(pings) / len(pings):.0f} ms")
+        return "  ·  ".join(parts)
+
     def _paint_games(self) -> None:
         c = self.canvas
         finder = self.game_finder
+        if self.session_view and not finder:
+            self._paint_session_history()
+            return
+        for row in self.t_games:
+            for col in L_HIST_COLS:
+                c.itemconfigure(row[col], text="")
+        for col in L_HIST_COLS:
+            c.itemconfigure(self.t_game_heads[col], text="")
+        ax, ay, aw, ah = L_GAME_AUTO
+        c.coords(self.t_game_auto, self.px(ax + 76), self.px(ay + ah / 2))
+        c.itemconfigure(self.t_game_auto, text="Apply the selected mode while a game runs, and undo it when the "
+                                               "game closes")
         c.itemconfigure(self.t_buttons["findgames"], text="Cancel" if finder else "Find games")
         if finder:
             items = finder.get("items", [])
@@ -7484,8 +7747,9 @@ class OptimizerApp(ctk.CTk):
             elif not os.path.isfile(game["path"]):
                 c.itemconfigure(items["sub"], text="File not found - it may have moved", fill=WARN_YELLOW)
             elif (last := self._last_session(game["path"])) is not None:
+                count = len(self._game_sessions(game["path"]))
                 sub = (f"Last played {format_day(last['end'])} for {format_duration(last['end'] - last['start'])}"
-                       "  ·  View report")
+                       f"  ·  {'View report' if count == 1 else f'{count} sessions'}")
                 c.itemconfigure(items["sub"], text=self._fit(sub, self.f_label, 350), fill=SILVER)
             else:
                 c.itemconfigure(items["sub"], text=self._fit(game["path"], self.f_label, 350), fill=TEXT_MID)
@@ -7534,6 +7798,9 @@ class OptimizerApp(ctk.CTk):
             self._job_origin = "game"
 
     def _find_games(self) -> None:
+        if self.session_view and not self.game_finder:  # "Back" from a game's session history
+            self._close_session_history()
+            return
         if self.game_finder:  # "Cancel"
             self.game_finder = None
             self.game_offset = 0

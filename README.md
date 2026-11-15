@@ -30,7 +30,7 @@ Before anything runs you see a preview of what will change on *your* PC, and aft
 - **Checkup**: one scan for settings that quietly cost performance: a monitor below its top refresh rate (fixed in one click), RAM below its rated speed (XMP/EXPO off), an old graphics driver, playing on Wi-Fi or a slow cable link, and a laptop on battery, with a score for how many look good.
 - **Ping**: latency, jitter and packet loss to your router, Cloudflare, Google, several cloud regions and any server you type in.
 - **Games**: add games by hand or let **Find games** scan Steam, Epic Games, Riot and GOG. Each game gets high CPU priority whenever it runs, is kept out of Windows' power throttling (EcoQoS), an optional *fullscreen optimizations off* switch, and an option to apply your mode while it runs and undo it when it closes.
-- **Session reports**: when a game closes you get a summary of how long you played, CPU and GPU load, the hottest GPU temperature and ping spikes. The last one stays on the game's row.
+- **Session reports**: when a game closes you get a summary of how long you played, CPU and GPU load, the hottest GPU temperature and ping spikes. Click a game to see all its sessions side by side, with averages, and open any of them.
 - **Startup**: turn apps that launch with Windows on or off, using the same switches as Task Manager.
 - **Cleanup**: clears old files from your temp folders, crash reports, Discord's cache, used Windows Update downloads and the Delivery Optimization cache. Only files untouched for a day are removed, and it asks first. It can also run by itself once a week, never while a game is running.
 - **DNS**: measures how fast your current DNS and Cloudflare, Google, Quad9, OpenDNS and AdGuard answer, and switches with one click. *Restore previous* puts your old setting back.
@@ -44,18 +44,19 @@ Six switches for ads and tracking built into Windows: ads and suggested apps in 
 
 - Starfield, plain black or your own picture as the background, with blur, dim, panel opacity and frost.
 - Motion: follow Windows, Full, Reduced or Off.
-- Keep running in the tray, start with Windows (elevated, no UAC prompt), a global hotkey (**Ctrl+Alt+O**) to toggle your mode in-game, an optional System Restore point before your first optimize each day, and a check for new versions.
+- Keep running in the tray, start with Windows (elevated, no UAC prompt), a global hotkey (**Ctrl+Alt+O**) to toggle your mode in-game, an optional System Restore point before your first optimize each day, a check for new versions, and **Back up / Restore** to move your settings, games, appearance and session history to another PC in one file.
 
 | | |
 |---|---|
 | <img src="docs/screenshots/tools-checkup.png" alt="Tools tab, gaming checkup"> | <img src="docs/screenshots/privacy.png" alt="Privacy tab"> |
 | <img src="docs/screenshots/appearance.png" alt="Appearance tab"> | <img src="docs/screenshots/settings.png" alt="Settings tab"> |
+| <img src="docs/screenshots/history.png" alt="Session history for one game"> | <img src="docs/screenshots/about.png" alt="About tab"> |
 
 ## Safe by design
 
 - **Undo is exact.** The first value each setting had before Astra Optimizer changed it is saved, so undoing never guesses.
 - **Hands off the important parts.** Audio, networking, security, Windows Update and anti-cheat services (Vanguard, Easy Anti-Cheat, BattlEye, FACEIT and others) are never stopped. RAM cleanup skips system processes, Medal and the games in your list.
-- **Nothing permanent without asking.** Resetting to Windows defaults, cleaning temp files, switching DNS and turning on System Protection each ask before they run.
+- **Nothing permanent without asking.** Resetting to Windows defaults, cleaning temp files, switching DNS, restoring a backup and turning on System Protection each ask before they run. Weekly cleanup only runs if you switch it on.
 - **Paused, not disabled.** Services that Max FPS pauses start again after a restart, or straight away with Undo.
 
 ## Download
