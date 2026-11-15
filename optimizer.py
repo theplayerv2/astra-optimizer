@@ -56,8 +56,8 @@ except Exception:  # pragma: no cover - depends on the build
 
 APP_NAME = "Astra Optimizer"
 LEGACY_APP_NAME = "Optimizer"  # pre-1.12 name: data folder and startup task are carried over
-APP_VERSION = "1.2.0"
-DISPLAY_VERSION = "v1.2.0"
+APP_VERSION = "1.3.0"
+DISPLAY_VERSION = "v1.3.0"
 CREDIT_NAME = "theplayerv2"
 CREDIT_URL = "https://guns.lol/playerv2"
 UPDATE_REPO = "theplayerv2/astra-optimizer"
@@ -3626,6 +3626,128 @@ class SessionPinger(threading.Thread):
                 continue
 
 
+# ---- FPS: Intel PresentMon (MIT, bundled in assets/presentmon) reads frame timing from Windows'
+# own event tracing. Nothing is injected into the game, so anti-cheat isn't involved.
+
+PRESENTMON_EXE = ("assets", "presentmon", "PresentMon.exe")
+
+
+def presentmon_path() -> str | None:
+    path = resource_path(*PRESENTMON_EXE)
+    return path if os.path.isfile(path) else None
+
+
+class FrameStats:
+    """Streaming frame-time histogram (0.05 ms buckets up to 250 ms), so a long session costs
+    a fixed ~40 KB however many frames it has."""
+
+    RES = 0.05
+    MAX_MS = 250.0
+
+    def __init__(self):
+        self.buckets = [0] * (int(self.MAX_MS / self.RES) + 1)
+        self.count = 0
+        self.total_ms = 0.0
+
+    def add(self, ms: float) -> None:
+        if not 0.05 <= ms <= 5000:  # ignore junk and the gap of a paused or alt-tabbed game
+            return
+        self.buckets[min(len(self.buckets) - 1, int(ms / self.RES))] += 1
+        self.count += 1
+        self.total_ms += ms
+
+    def percentile(self, pct: float) -> float:
+        """Frame time (ms) that pct% of frames are at or below."""
+        target, seen = self.count * pct / 100.0, 0
+        for index, n in enumerate(self.buckets):
+            seen += n
+            if seen >= target and n:
+                return (index + 0.5) * self.RES
+        return self.MAX_MS
+
+    def summary(self) -> dict | None:
+        if self.count < 120 or self.total_ms <= 0:  # not enough frames to say anything
+            return None
+        median = self.percentile(50)
+        threshold = max(2 * median, median + 8)  # a frame that took twice as long, and noticeably so
+        first = min(len(self.buckets) - 1, int(threshold / self.RES) + 1)
+        return {"fps_avg": self.count * 1000.0 / self.total_ms, "fps_low1": 1000.0 / self.percentile(99),
+                "fps_spikes": sum(self.buckets[first:]), "fps_spike_ms": threshold, "frames": self.count}
+
+
+class FrameCapture(threading.Thread):
+    """Runs PresentMon for one game (by exe name) and keeps one FrameStats per swap chain; the
+    busiest swap chain is the game itself (launchers and overlays draw far fewer frames)."""
+
+    def __init__(self, exe_name: str, command: list[str] | None = None):
+        super().__init__(name=f"fps-{exe_name}", daemon=True)
+        safe = re.sub(r"[^A-Za-z0-9]", "", os.path.splitext(exe_name)[0])[:24] or "game"
+        self.session_name = f"AstraOptimizer-{safe}"
+        self.command = command or [presentmon_path() or "PresentMon.exe", "--process_name", exe_name,
+                                   "--output_stdout", "--no_console_stats", "--session_name", self.session_name,
+                                   "--stop_existing_session", "--terminate_on_proc_exit", "--no_track_input"]
+        self.stats: dict[tuple, FrameStats] = {}
+        self.error: str | None = None
+        self.proc: subprocess.Popen | None = None
+        self._stopping = False
+
+    def run(self) -> None:
+        import csv
+        try:
+            self.proc = subprocess.Popen(self.command, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                                         stdin=subprocess.DEVNULL, text=True, encoding="utf-8", errors="replace",
+                                         creationflags=CREATE_NO_WINDOW)
+        except OSError as exc:
+            self.error = str(exc)
+            return
+        columns: dict[str, int] = {}
+        try:
+            for row in csv.reader(self.proc.stdout):
+                if not columns:
+                    lowered = [c.strip().lower() for c in row]
+                    if "msbetweenpresents" in lowered or "frametime" in lowered:
+                        columns = {name: i for i, name in enumerate(lowered)}
+                    continue
+                ms_col = columns.get("msbetweenpresents", columns.get("frametime"))
+                try:
+                    ms = float(row[ms_col])
+                except (ValueError, IndexError, TypeError):
+                    continue
+                key = (row[columns["processid"]] if "processid" in columns and len(row) > columns["processid"] else "",
+                       row[columns["swapchainaddress"]] if "swapchainaddress" in columns
+                       and len(row) > columns["swapchainaddress"] else "")
+                stats = self.stats.get(key)
+                if stats is None:
+                    stats = self.stats[key] = FrameStats()
+                stats.add(ms)
+        except (OSError, ValueError):
+            pass
+        if not self.stats and not self._stopping:
+            try:
+                err = self.proc.stderr.read() if self.proc.stderr else ""
+            except (OSError, ValueError):
+                err = ""
+            lines = [l.strip() for l in err.splitlines() if l.strip().lower().startswith("error")]
+            self.error = lines[0] if lines else None
+
+    def stop(self, wait: float = 3.0) -> None:
+        self._stopping = True
+        if self.proc is not None and self.proc.poll() is None:
+            try:
+                self.proc.terminate()
+            except OSError:
+                pass
+        self.join(wait)
+        if presentmon_path():  # make sure the trace session is gone, not just the process
+            run_command([presentmon_path(), "--session_name", self.session_name, "--terminate_existing_session"],
+                        timeout=10)
+
+    def summary(self) -> dict | None:
+        if not self.stats:
+            return None
+        return max(self.stats.values(), key=lambda st: st.count).summary()
+
+
 def new_session(exe: str, name: str, now: float | None = None) -> dict:
     return {"exe": exe, "name": name, "start": now or time.time(), "n": 0, "cpu_sum": 0.0, "cpu_peak": 0.0,
             "gpu_sum": 0.0, "gpu_n": 0, "gpu_peak": 0.0, "temp_peak": None, "ram_peak": 0.0, "pings": []}
@@ -3652,6 +3774,7 @@ def finish_session(session: dict, now: float | None = None) -> dict | None:
     if end - session["start"] < SESSION_MIN_SECONDS or not session["n"]:
         return None
     report = {"exe": session["exe"], "name": session["name"], "start": session["start"], "end": end,
+              **(session.get("fps") or {}),
               "cpu_avg": session["cpu_sum"] / session["n"], "cpu_peak": session["cpu_peak"],
               "ram_peak": session["ram_peak"], "temp_peak": session["temp_peak"],
               "gpu_avg": session["gpu_sum"] / session["gpu_n"] if session["gpu_n"] else None,
@@ -3691,6 +3814,11 @@ def format_day(stamp: float, now: float | None = None) -> str:
 def session_report_text(report: dict) -> str:
     lines = [f"Played for {format_duration(report['end'] - report['start'])}, "
              f"{format_clock(report['start'])} to {format_clock(report['end'])}.", ""]
+    if report.get("fps_avg") is not None:
+        spikes = report.get("fps_spikes", 0)
+        lines.append(f"FPS: {report['fps_avg']:.0f} average, {report['fps_low1']:.0f} 1% low, "
+                     + (f"{spikes} stutter spike{'s' if spikes != 1 else ''} over {report['fps_spike_ms']:.0f} ms"
+                        if spikes else "no stutter spikes"))
     lines.append(f"CPU load: {report['cpu_avg']:.0f}% average, {report['cpu_peak']:.0f}% peak")
     if report.get("gpu_avg") is not None:
         lines.append(f"GPU load: {report['gpu_avg']:.0f}% average, {report['gpu_peak']:.0f}% peak")
@@ -3716,6 +3844,8 @@ def session_report_text(report: dict) -> str:
 
 def session_summary(report: dict) -> str:
     parts = [format_duration(report["end"] - report["start"])]
+    if report.get("fps_avg") is not None:
+        parts.append(f"{report['fps_avg']:.0f} FPS ({report['fps_low1']:.0f} 1% low)")
     if report.get("gpu_avg") is not None:
         parts.append(f"GPU {report['gpu_avg']:.0f}% average")
     if report.get("temp_peak") is not None:
@@ -3790,7 +3920,16 @@ L_TABLE = (78, 100, 628, 312)
 L_GAME_ROW_Y0, L_GAME_ROW_H, GAME_ROWS = 134, 46, 6
 L_GAME_COLS = {"name": 94, "prio": 466, "fso": 566, "del": 664}
 L_GAME_AUTO = (78, 424, 628, 42)
-L_HIST_COLS = {"cpu": 404, "gpu": 486, "temp": 568, "ping": 648}  # centre of each stat column
+L_HIST_COLS = {"fps": 382, "cpu": 456, "gpu": 522, "temp": 588, "ping": 654}  # centre of each stat column
+L_CMP_COLS = {"a": 438, "b": 540, "chg": 646}  # Compare view: older, newer, change
+COMPARE_METRICS = [  # key, label, hint, unit, which way is better
+    ("fps_avg", "Average FPS", "Higher is better", "fps", "up"),
+    ("fps_low1", "1% low FPS", "Higher means fewer dips", "fps", "up"),
+    ("spike_rate", "Stutter spikes", "Per hour, lower is better", "/h", "down"),
+    ("gpu_avg", "GPU load", "How hard the graphics card worked", "%", None),
+    ("temp_peak", "Hottest GPU", "Lower is better", "°C", "down"),
+    ("ping_avg", "Ping", "To Cloudflare, lower is better", "ms", "down"),
+]
 L_START_ROW_Y0, L_START_ROW_H, START_ROWS = 134, 39, 7
 L_START_COLS = {"name": 94, "source": 446, "toggle": 646}
 L_CLEAN_ROWS = {key: (78, 100 + i * 48, 628, 44)
@@ -4650,6 +4789,8 @@ class OptimizerApp(ctk.CTk):
         self.gpu_setup: dict | None = None
         self.sessions_live: dict[str, dict] = {}
         self.session_view: str | None = None  # a game's path while its session history is shown
+        self.compare_pick: list[int] | None = None  # picking sessions to compare (indices, newest first)
+        self.compare_pair: list[dict] | None = None  # the two sessions being compared, older first
         self.privacy_state: dict[str, bool] = {}
         self._privacy_busy = False
         self._privacy_defaults: list = []
@@ -5337,7 +5478,7 @@ class OptimizerApp(ctk.CTk):
         x, y, w, h = L_ABOUT_ROWS["info"]
         for i, (label, value, font) in enumerate((
                 ("License", "MIT - free to use, change and share", self.f_desc),
-                ("Built with", "Python, customtkinter, Pillow, psutil and pystray", self.f_desc),
+                ("Built with", "Python, customtkinter, Pillow, psutil, pystray and Intel PresentMon", self.f_desc),
                 ("Your data", STATE_DIR, self.f_mono))):
             ry = y + 22 + i * 32
             c.create_text(px(x + 20), px(ry), anchor="nw", text=label, font=self.f_label, fill=TEXT_MID, tags=ab)
@@ -5424,6 +5565,11 @@ class OptimizerApp(ctk.CTk):
                                                    font=self.f_label, fill=ASH, tags=g)
         for col, cx in L_HIST_COLS.items():
             self.t_game_heads[col] = c.create_text(px(cx), px(head_y), anchor="n", font=self.f_label, fill=ASH, tags=g)
+        self.t_cmp_heads = {col: c.create_text(px(cx), px(head_y), anchor="n", font=self.f_label, fill=ASH, tags=g)
+                            for col, cx in L_CMP_COLS.items()}
+        self.t_cmp = [{col: c.create_text(px(cx), px(L_GAME_ROW_Y0 + i * L_GAME_ROW_H + 12), anchor="n",
+                                          font=self.f_plan, fill=TEXT_HI, tags=g) for col, cx in L_CMP_COLS.items()}
+                      for i in range(GAME_ROWS)]
         self.t_games = []
         for i in range(GAME_ROWS):
             ry = L_GAME_ROW_Y0 + i * L_GAME_ROW_H
@@ -5777,7 +5923,9 @@ class OptimizerApp(ctk.CTk):
         if key == "checkup":
             return tools_page == "checkup" and self.checkup_state == "idle"
         if kind == "hist":
-            return tools_page == "games" and bool(self.session_view)
+            return tools_page == "games" and bool(self.session_view) and not self.compare_pair
+        if key == "addgame" and self.session_view and not self.game_finder:
+            return tools_page == "games" and not self.compare_pair and len(self._game_sessions(self.session_view)) >= 2
         if kind == "game":
             return tools_page == "games"
         if kind == "startup":
@@ -6040,7 +6188,7 @@ class OptimizerApp(ctk.CTk):
         px = self.px
         self._render_segment(scene, "tool", TOOL_PAGES)
         for key, rect in TOOL_PAGE_BUTTONS[self.tool_page].items():
-            if key == "addgame" and self.session_view and not self.game_finder:
+            if key == "addgame" and self.session_view and not self.game_finder and self.compare_pair:
                 continue
             if key in PRIMARY_TOOL_BUTTONS or (key == "addgame" and self.game_finder):
                 self._render_primary(scene, key, rect)
@@ -6115,7 +6263,15 @@ class OptimizerApp(ctk.CTk):
             if self.settings_dns_original():
                 self._render_ghost(scene, "dnsrestore", L_DNS_RESTORE)
         elif self.tool_page == "games" and self.session_view:
-            pass
+            if self.compare_pick:
+                for index in self.compare_pick:
+                    i = index - self.game_offset
+                    if 0 <= i < GAME_ROWS:
+                        rx, ry, rw, rh = L_TABLE[0] + 6, L_GAME_ROW_Y0 + i * L_GAME_ROW_H - 4, L_TABLE[2] - 12, 42
+                        ring = self._cached(("pick-ring", rw, rh), lambda: self.painter.shape(
+                            px(rw), px(rh), px(10), fill=rgba(STARLIGHT, 14), border=(255, 255, 255, 150),
+                            border_width=1.2))
+                        paste_layer(scene, ring, px(rx), px(ry))
         elif self.tool_page == "games":
             for i in range(min(GAME_ROWS, len(self.games) - self.game_offset)):
                 index = self.game_offset + i
@@ -6288,11 +6444,13 @@ class OptimizerApp(ctk.CTk):
                 index = min(len(TOOL_PAGES) - 1, max(0, int((lx - x) / (w / len(TOOL_PAGES)))))
                 return f"seg:tool:{TOOL_PAGES[index][0]}"
             for key, rect in TOOL_PAGE_BUTTONS[self.tool_page].items():
-                if key == "addgame" and self.session_view and not self.game_finder:
+                if key == "addgame" and self.session_view and not self.game_finder and self.compare_pair:
                     continue
                 if inside(rect):
                     return f"btn:{key}"
             if self.tool_page == "games" and self.session_view and not self.game_finder:
+                if self.compare_pair:
+                    return None
                 sessions = self._game_sessions(self.session_view)
                 for i in range(min(GAME_ROWS, len(sessions) - self.game_offset)):
                     ry = L_GAME_ROW_Y0 + i * L_GAME_ROW_H
@@ -6572,7 +6730,9 @@ class OptimizerApp(ctk.CTk):
             self._checkup_action(key)
         elif kind == "hist":
             sessions = self._game_sessions(self.session_view or "")
-            if 0 <= int(key) < len(sessions):
+            if self.compare_pick is not None:
+                self._pick_session(int(key))
+            elif 0 <= int(key) < len(sessions):
                 self._show_session_report(sessions[int(key)])
         elif kind == "priv":
             self._toggle_privacy([key], not self.privacy_state.get(key, False))
@@ -6586,7 +6746,10 @@ class OptimizerApp(ctk.CTk):
         elif kind == "clean":
             self._toggle_clean_target(key)
         elif target == "btn:addgame":
-            self._add_found_games() if self.game_finder else self._add_game()
+            if self.session_view and not self.game_finder:
+                self._toggle_compare_pick()
+            else:
+                self._add_found_games() if self.game_finder else self._add_game()
         elif target == "btn:refresh":
             self._load_startup()
         elif target == "btn:clean":
@@ -6804,7 +6967,7 @@ class OptimizerApp(ctk.CTk):
             if self.game_finder:
                 total = len(self.game_finder.get("items", []))
             elif self.session_view:
-                total = len(self._game_sessions(self.session_view))
+                total = 0 if self.compare_pair else len(self._game_sessions(self.session_view))
             else:
                 total = len(self.games)
             self.game_offset = max(0, min(max(0, total - GAME_ROWS), self.game_offset + step))
@@ -7960,7 +8123,11 @@ class OptimizerApp(ctk.CTk):
     def _start_session(self, exe: str) -> None:
         if exe in self.sessions_live:
             return
-        self.sessions_live[exe] = new_session(exe, self._game_name(exe))
+        session = self.sessions_live[exe] = new_session(exe, self._game_name(exe))
+        if self.admin and presentmon_path():
+            capture = FrameCapture(os.path.basename(exe))
+            capture.start()
+            session["capture"] = capture
         if self.session_pinger is None:
             self.session_pinger = SessionPinger(self.events)
             self.session_pinger.start()
@@ -7972,6 +8139,12 @@ class OptimizerApp(ctk.CTk):
             self.session_pinger = None
         if session is None:
             return
+        capture = session.pop("capture", None)
+        if capture is not None:
+            capture.stop()
+            session["fps"] = capture.summary()
+            if session["fps"] is None and capture.error:
+                self._emit("warn", f"FPS wasn't measured for {session['name']}: {capture.error}")
         report = finish_session(session)
         if report is None:
             return
@@ -8008,27 +8181,35 @@ class OptimizerApp(ctk.CTk):
 
     def _open_session_history(self, path: str) -> None:
         self.session_view, self.game_offset = path, 0
+        self.compare_pick = self.compare_pair = None
         self._paint_games()
         self.canvas.configure(cursor="hand2" if self._enabled(self.hover) else "")
         self._render()
 
     def _close_session_history(self) -> None:
         self.session_view, self.game_offset = None, 0
+        self.compare_pick = self.compare_pair = None
+        self._clear_compare_texts()
         self._paint_games()
         self._render()
 
     def _paint_session_history(self) -> None:
         c = self.canvas
+        self._clear_compare_texts()
+        if self.compare_pair:
+            self._paint_compare()
+            return
         path = self.session_view
         sessions = self._game_sessions(path)
         name = self._game_name(os.path.normcase(path))
         c.itemconfigure(self.t_buttons["findgames"], text="Back")
-        c.itemconfigure(self.t_buttons["addgame"], text="")
+        c.itemconfigure(self.t_buttons["addgame"], text="Cancel" if self.compare_pick is not None else "Compare")
         c.itemconfigure(self.t_game_heads["name"], text=self._fit(f"{name.upper()}  ·  {len(sessions)} SESSIONS",
                                                                   self.f_label, 280))
         for col in ("prio", "fso"):
             c.itemconfigure(self.t_game_heads[col], text="")
-        for col, label in (("cpu", "CPU AVG"), ("gpu", "GPU AVG"), ("temp", "HOTTEST"), ("ping", "PING")):
+        for col, label in (("fps", "FPS · 1% LOW"), ("cpu", "CPU"), ("gpu", "GPU"), ("temp", "HOTTEST"),
+                           ("ping", "PING")):
             c.itemconfigure(self.t_game_heads[col], text=label)
         for i, row in enumerate(self.t_games):
             index = self.game_offset + i
@@ -8043,6 +8224,8 @@ class OptimizerApp(ctk.CTk):
             c.itemconfigure(row["sub"], text=format_duration(r["end"] - r["start"]), fill=TEXT_MID)
             hot = (r.get("temp_peak") or 0) >= 85
             lossy = (r.get("ping_loss") or 0) >= 2 or (r.get("ping_spikes") or 0) >= 5
+            c.itemconfigure(row["fps"], text="–" if r.get("fps_avg") is None
+                            else f"{r['fps_avg']:.0f} / {r['fps_low1']:.0f}", fill=TEXT_HI)
             c.itemconfigure(row["cpu"], text=f"{r['cpu_avg']:.0f}%", fill=TEXT_HI)
             c.itemconfigure(row["gpu"], text="–" if r.get("gpu_avg") is None else f"{r['gpu_avg']:.0f}%", fill=TEXT_HI)
             c.itemconfigure(row["temp"], text="–" if r.get("temp_peak") is None else f"{r['temp_peak']:.0f} °C",
@@ -8052,7 +8235,114 @@ class OptimizerApp(ctk.CTk):
         c.itemconfigure(self.t_games_empty, text="" if sessions else "No sessions saved for this game yet.")
         ax, ay, aw, ah = L_GAME_AUTO
         c.coords(self.t_game_auto, self.px(ax + 18), self.px(ay + ah / 2))  # no switch in this view
-        c.itemconfigure(self.t_game_auto, text=self._fit(self._history_summary(sessions), self.f_desc, aw - 36))
+        if self.compare_pick is not None:
+            summary = f"Pick two sessions to compare ({len(self.compare_pick)} of 2 picked)"
+        else:
+            summary = self._history_summary(sessions)
+        c.itemconfigure(self.t_game_auto, text=self._fit(summary, self.f_desc, aw - 36))
+
+    def _clear_compare_texts(self) -> None:
+        c = self.canvas
+        for item in self.t_cmp_heads.values():
+            c.itemconfigure(item, text="")
+        for row in self.t_cmp:
+            for item in row.values():
+                c.itemconfigure(item, text="")
+
+    @staticmethod
+    def _compare_value(report: dict, key: str):
+        if key == "spike_rate":
+            if report.get("fps_spikes") is None:
+                return None
+            hours = max(1 / 60, (report["end"] - report["start"]) / 3600)
+            return report["fps_spikes"] / hours
+        return report.get(key)
+
+    @staticmethod
+    def _compare_change(key: str, old, new, better):
+        """(text, colour) for the change from the older to the newer session."""
+        if old is None or new is None:
+            return "", TEXT_MID
+        if key.startswith("fps_"):
+            pct = (new - old) / old * 100 if old else 0
+            if abs(pct) < 2:
+                return "Same", TEXT_MID
+            text, delta = f"{pct:+.0f}%", pct
+        else:
+            delta = new - old
+            if abs(delta) < 1:
+                return "Same", TEXT_MID
+            unit = {"spike_rate": "/h", "gpu_avg": " pts", "temp_peak": " °C", "ping_avg": " ms"}[key]
+            text = f"{delta:+.0f}{unit}"
+        if better is None:
+            return text, TEXT_MID
+        good = delta > 0 if better == "up" else delta < 0
+        return text, TEXT_HI if good else WARN_YELLOW
+
+    def _paint_compare(self) -> None:
+        c = self.canvas
+        old, new = self.compare_pair
+        c.itemconfigure(self.t_buttons["findgames"], text="Back")
+        c.itemconfigure(self.t_buttons["addgame"], text="")
+        c.itemconfigure(self.t_game_heads["name"], text="COMPARING")
+        for col in ("prio", "fso", *L_HIST_COLS):
+            c.itemconfigure(self.t_game_heads[col], text="")
+
+        def when(r: dict) -> str:
+            return f"{format_day(r['end']).upper()}, {format_clock(r['start'])}"
+
+        c.itemconfigure(self.t_cmp_heads["a"], text=when(old))
+        c.itemconfigure(self.t_cmp_heads["b"], text=when(new))
+        c.itemconfigure(self.t_cmp_heads["chg"], text="CHANGE")
+        units = {"fps": "", "/h": "/h", "%": "%", "°C": " °C", "ms": " ms"}
+        for row, cmp_row, (key, label, hint, unit, better) in zip(self.t_games, self.t_cmp, COMPARE_METRICS):
+            a, b = self._compare_value(old, key), self._compare_value(new, key)
+            c.itemconfigure(row["name"], text=label, fill=TEXT_HI)
+            c.itemconfigure(row["sub"], text=hint, fill=TEXT_MID)
+            for col in L_HIST_COLS:
+                c.itemconfigure(row[col], text="")
+            c.itemconfigure(cmp_row["a"], text="–" if a is None else f"{a:.0f}{units[unit]}", fill=TEXT_HI)
+            c.itemconfigure(cmp_row["b"], text="–" if b is None else f"{b:.0f}{units[unit]}", fill=TEXT_HI)
+            text, colour = self._compare_change(key, a, b, better)
+            c.itemconfigure(cmp_row["chg"], text=text, fill=colour)
+        c.itemconfigure(self.t_games_empty, text="")
+        ax, ay, aw, ah = L_GAME_AUTO
+        c.coords(self.t_game_auto, self.px(ax + 18), self.px(ay + ah / 2))
+        c.itemconfigure(self.t_game_auto, text=self._fit(self._compare_note(old, new), self.f_desc, aw - 36))
+
+    @staticmethod
+    def _compare_note(old: dict, new: dict) -> str:
+        """Whether the two sessions can fairly be compared."""
+        da, db = old["end"] - old["start"], new["end"] - new["start"]
+        if old.get("fps_avg") is None or new.get("fps_avg") is None:
+            return "One of these sessions has no FPS data, so only the other numbers compare."
+        if min(da, db) < 300:
+            return "One session is under 5 minutes, too short for a reliable comparison."
+        if max(da, db) / max(1, min(da, db)) > 3:
+            return (f"Very different lengths ({format_duration(da)} vs {format_duration(db)}), so the numbers may "
+                    "not be comparable.")
+        return f"{format_duration(da)} vs {format_duration(db)}. For a fair test, play the same map or mode both times."
+
+    def _toggle_compare_pick(self) -> None:
+        self.compare_pick = None if self.compare_pick is not None else []
+        self._paint_games()
+        self.canvas.configure(cursor="hand2" if self._enabled(self.hover) else "")
+        self._render()
+
+    def _pick_session(self, index: int) -> None:
+        if index in self.compare_pick:
+            self.compare_pick.remove(index)
+        else:
+            self.compare_pick.append(index)
+        if len(self.compare_pick) == 2:
+            sessions = self._game_sessions(self.session_view)
+            pair = [sessions[i] for i in self.compare_pick if 0 <= i < len(sessions)]
+            self.compare_pick = None
+            if len(pair) == 2:
+                self.compare_pair = sorted(pair, key=lambda r: r["start"])
+        self._paint_games()
+        self.canvas.configure(cursor="hand2" if self._enabled(self.hover) else "")
+        self._render()
 
     @staticmethod
     def _history_summary(sessions: list[dict]) -> str:
@@ -8060,9 +8350,12 @@ class OptimizerApp(ctk.CTk):
             return ""
         played = sum(r["end"] - r["start"] for r in sessions)
         parts = [f"{len(sessions)} session{'s' if len(sessions) != 1 else ''}, {format_duration(played)} played"]
+        fps = [r["fps_avg"] for r in sessions if r.get("fps_avg") is not None]
         gpu = [r["gpu_avg"] for r in sessions if r.get("gpu_avg") is not None]
         temps = [r["temp_peak"] for r in sessions if r.get("temp_peak") is not None]
         pings = [r["ping_avg"] for r in sessions if r.get("ping_avg") is not None]
+        if fps:
+            parts.append(f"{sum(fps) / len(fps):.0f} FPS on average")
         if gpu:
             parts.append(f"GPU {sum(gpu) / len(gpu):.0f}% on average")
         if temps:
@@ -8077,6 +8370,7 @@ class OptimizerApp(ctk.CTk):
         if self.session_view and not finder:
             self._paint_session_history()
             return
+        self._clear_compare_texts()
         for row in self.t_games:
             for col in L_HIST_COLS:
                 c.itemconfigure(row[col], text="")
@@ -8185,8 +8479,13 @@ class OptimizerApp(ctk.CTk):
             self._job_origin = "game"
 
     def _find_games(self) -> None:
-        if self.session_view and not self.game_finder:  # "Back" from a game's session history
-            self._close_session_history()
+        if self.session_view and not self.game_finder:  # "Back": compare -> history -> your games
+            if self.compare_pair or self.compare_pick is not None:
+                self.compare_pair = self.compare_pick = None
+                self._paint_games()
+                self._render()
+            else:
+                self._close_session_history()
             return
         if self.game_finder:  # "Cancel"
             self.game_finder = None
@@ -8958,6 +9257,9 @@ class OptimizerApp(ctk.CTk):
         self._ping_stop.set()
         if self.session_pinger is not None:
             self.session_pinger.stop_event.set()
+        for session in self.sessions_live.values():
+            if session.get("capture") is not None:
+                session["capture"].stop(wait=1.0)
         if self.game_watcher is not None:
             self.game_watcher.stop_event.set()
         self._stop_hotkey()

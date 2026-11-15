@@ -35,7 +35,7 @@ Before anything runs you see a preview of what will change on *your* PC, and aft
 - **Checkup**: one scan for settings that quietly cost performance: a monitor below its top refresh rate (fixed in one click), RAM below its rated speed (XMP/EXPO off), an old graphics driver, games running on a laptop's built-in graphics instead of its fast GPU, a graphics card in a slow slot, Game Mode or windowed-game optimizations off, Memory Integrity's FPS cost (explained, never changed for you), a nearly full drive or TRIM off, Wi-Fi or a slow cable link, and a laptop on battery. A score shows how many look good.
 - **Ping**: latency, jitter and packet loss to your router, Cloudflare, Google, several cloud regions and any server you type in.
 - **Games**: add games by hand or let **Find games** scan Steam, Epic Games, Riot and GOG. Each game gets high CPU priority whenever it runs, is kept out of Windows' power throttling (EcoQoS), runs on the fast GPU on laptops with two graphics chips, an optional *fullscreen optimizations off* switch, and an option to apply your mode while it runs and undo it when it closes.
-- **Session reports**: when a game closes you get a summary of how long you played, CPU and GPU load, the hottest GPU temperature and ping spikes. Click a game to see all its sessions side by side, with averages, and open any of them.
+- **Session reports and FPS**: while a game runs, Astra measures its real frame rate with Intel's PresentMon (it reads Windows' own frame timing, nothing is injected into the game). When the game closes you get average FPS, 1% lows, stutter spikes, CPU and GPU load, the hottest GPU temperature and ping. Click a game to see all its sessions with averages, and **Compare** any two of them side by side, for example before and after Max FPS.
 - **Startup**: turn apps that launch with Windows on or off, using the same switches as Task Manager.
 - **Cleanup**: clears old files from your temp folders, crash reports, Discord's cache, used Windows Update downloads and the Delivery Optimization cache. Only files untouched for a day are removed, and it asks first. It can also run by itself once a week, never while a game is running.
 - **DNS**: measures how fast your current DNS and Cloudflare, Google, Quad9, OpenDNS and AdGuard answer, and switches with one click. *Restore previous* puts your old setting back.
@@ -55,7 +55,7 @@ Six switches for ads and tracking built into Windows: ads and suggested apps in 
 |---|---|
 | <img src="docs/screenshots/tools-checkup.png" alt="Tools tab, gaming checkup"> | <img src="docs/screenshots/privacy.png" alt="Privacy tab"> |
 | <img src="docs/screenshots/appearance.png" alt="Appearance tab"> | <img src="docs/screenshots/settings.png" alt="Settings tab"> |
-| <img src="docs/screenshots/history.png" alt="Session history for one game"> | <img src="docs/screenshots/about.png" alt="About tab"> |
+| <img src="docs/screenshots/history.png" alt="Session history for one game"> | <img src="docs/screenshots/compare.png" alt="Comparing two sessions"> |
 
 ## Safe by design
 
@@ -129,8 +129,9 @@ Settings, the undo snapshot, your background picture and the log are stored in
 Made by **theplayerv2**: [guns.lol/playerv2](https://guns.lol/playerv2)
 
 Built with Python, [customtkinter](https://github.com/TomSchimansky/CustomTkinter),
-[Pillow](https://python-pillow.org), [psutil](https://github.com/giampaolo/psutil) and
-[pystray](https://github.com/moses-palmer/pystray).
+[Pillow](https://python-pillow.org), [psutil](https://github.com/giampaolo/psutil),
+[pystray](https://github.com/moses-palmer/pystray) and [Intel PresentMon](https://github.com/GameTechDev/PresentMon)
+(bundled under its MIT license, see `assets/presentmon/LICENSE.txt`).
 
 ## License
 

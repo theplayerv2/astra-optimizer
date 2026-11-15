@@ -4,9 +4,16 @@ What changed in each version of Astra Optimizer. The newest version is at the to
 
 When a version is tagged on GitHub (for example `v1.2.0`), its section below becomes the release notes.
 
-## Unreleased
+## v1.3.0 - Unreleased
 
-Nothing yet.
+### Added
+- **FPS measurement:** while a game from your list runs, Astra records its frame rate with Intel PresentMon (bundled,
+  MIT license). It reads frame timing from Windows' own event tracing, so nothing is injected into the game and
+  anti-cheat isn't involved. Session reports show average FPS, 1% low and stutter spikes.
+- **FPS in session history:** a new FPS / 1% low column, and average FPS in the totals line.
+- **Compare:** in a game's history, pick any two sessions to see average FPS, 1% low, stutter spikes per hour, GPU
+  load, hottest temperature and ping side by side with the change between them. A note says when the sessions are
+  too different to compare fairly.
 
 ## v1.2.0 - 2026-11-15
 

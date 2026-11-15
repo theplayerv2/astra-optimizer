@@ -6,3 +6,4 @@
 *.png binary
 *.ico binary
 *.yml text eol=lf
+*.exe binary
