@@ -43,7 +43,7 @@ from tkinter import filedialog, messagebox
 
 import customtkinter as ctk
 import psutil
-from PIL import Image, ImageChops, ImageDraw, ImageEnhance, ImageFilter, ImageOps, ImageTk
+from PIL import Image, ImageChops, ImageDraw, ImageEnhance, ImageFilter, ImageFont, ImageOps, ImageTk
 
 try:  # optional: without it the app simply runs without a tray icon
     import pystray
@@ -2144,7 +2144,7 @@ DEFAULT_SETTINGS = {"tray": True, "autostart": False, "hotkey": True, "custom_ho
                     "preview": True, "games": [], "game_auto": False, "clean_skip": [], "clean_weekly": False, "clean_at": 0,
                     "dns_original": None,
                     "restore_point": True, "restore_point_at": 0, "updates": True, "sessions": [],
-                    "overlay": True, "overlay_pos": None}
+                    "overlay": True, "overlay_pos": None, "overlay_style": None}
 
 
 # --------------------------------------------------------------------------------------
@@ -3950,6 +3950,15 @@ class FrameCapture(threading.Thread):
             return None
         return max(self.stats.values(), key=lambda st: st.count).summary()
 
+    def recent_frames(self, count: int) -> list[float]:
+        """The busiest swap chain's last frame times (ms), oldest first; empty when it's gone quiet."""
+        if not self.stats:
+            return []
+        key = max(self.stats, key=lambda k: self.stats[k].count)
+        if time.monotonic() - self.last_frame.get(key, 0) > 2.0:
+            return []
+        return list(self.recent.get(key) or [])[-count:]
+
     def live(self) -> tuple[float, float] | None:
         """(FPS over the last second, 1% low over the last ~2400 frames), or None when the game
         hasn't drawn anything for 2 s (minimised, loading)."""
@@ -4949,90 +4958,281 @@ class ConsoleView:
         self._pin_backdrop()
 
 
-_ov_api = ctypes.WinDLL("user32")  # private function objects for the overlay's window styles
+_ov_api = ctypes.WinDLL("user32")  # private function objects for the overlay's layered window
 _ov_api.GetParent.argtypes, _ov_api.GetParent.restype = [wintypes.HWND], wintypes.HWND
 _ov_api.GetWindowLongW.argtypes, _ov_api.GetWindowLongW.restype = [wintypes.HWND, ctypes.c_int], ctypes.c_long
 _ov_api.SetWindowLongW.argtypes, _ov_api.SetWindowLongW.restype = [wintypes.HWND, ctypes.c_int, ctypes.c_long], ctypes.c_long
+_ov_api.GetDC.argtypes, _ov_api.GetDC.restype = [wintypes.HWND], wintypes.HDC
+_ov_api.ReleaseDC.argtypes, _ov_api.ReleaseDC.restype = [wintypes.HWND, wintypes.HDC], ctypes.c_int
+_ov_api.UpdateLayeredWindow.argtypes = [wintypes.HWND, wintypes.HDC, ctypes.POINTER(wintypes.POINT),
+                                        ctypes.POINTER(wintypes.SIZE), wintypes.HDC, ctypes.POINTER(wintypes.POINT),
+                                        wintypes.DWORD, ctypes.c_void_p, wintypes.DWORD]
+_ov_api.UpdateLayeredWindow.restype = wintypes.BOOL
+_ov_gdi = ctypes.WinDLL("gdi32")
+_ov_gdi.CreateCompatibleDC.argtypes, _ov_gdi.CreateCompatibleDC.restype = [wintypes.HDC], wintypes.HDC
+_ov_gdi.CreateDIBSection.argtypes = [wintypes.HDC, ctypes.c_void_p, wintypes.UINT, ctypes.POINTER(ctypes.c_void_p),
+                                     wintypes.HANDLE, wintypes.DWORD]
+_ov_gdi.CreateDIBSection.restype = wintypes.HBITMAP
+_ov_gdi.SelectObject.argtypes, _ov_gdi.SelectObject.restype = [wintypes.HDC, wintypes.HGDIOBJ], wintypes.HGDIOBJ
+_ov_gdi.DeleteObject.argtypes, _ov_gdi.DeleteObject.restype = [wintypes.HGDIOBJ], wintypes.BOOL
+_ov_gdi.DeleteDC.argtypes, _ov_gdi.DeleteDC.restype = [wintypes.HDC], wintypes.BOOL
 GWL_EXSTYLE_I = -20
-WS_EX_TOPMOST_, WS_EX_TOOLWINDOW_, WS_EX_NOACTIVATE_ = 0x00000008, 0x00000080, 0x08000000
+WS_EX_TOPMOST_, WS_EX_TOOLWINDOW_, WS_EX_LAYERED_, WS_EX_NOACTIVATE_ = 0x8, 0x80, 0x80000, 0x08000000
+ULW_ALPHA_ = 0x2
+
+
+class _BlendFunction(ctypes.Structure):
+    _fields_ = [("BlendOp", ctypes.c_ubyte), ("BlendFlags", ctypes.c_ubyte),
+                ("SourceConstantAlpha", ctypes.c_ubyte), ("AlphaFormat", ctypes.c_ubyte)]
+
+
+def push_layered(hwnd: int, image: Image.Image, x: int, y: int) -> bool:
+    """Show an RGBA image as a per-pixel-transparent window (alpha 0 is also click-through)."""
+    w, h = image.size
+    r, g, b, a = image.split()
+    premultiplied = Image.merge("RGBA", (ImageChops.multiply(b, a), ImageChops.multiply(g, a),
+                                         ImageChops.multiply(r, a), a))  # BGRA, premultiplied
+    data = premultiplied.tobytes()
+    screen = _ov_api.GetDC(None)
+    memory = _ov_gdi.CreateCompatibleDC(screen)
+    bits = ctypes.c_void_p()
+    header = _BitmapInfoHeader(ctypes.sizeof(_BitmapInfoHeader), w, -h, 1, 32, 0, 0, 0, 0, 0, 0)
+    bitmap = _ov_gdi.CreateDIBSection(memory, ctypes.byref(header), 0, ctypes.byref(bits), None, 0)
+    try:
+        if not bitmap or not bits.value:
+            return False
+        ctypes.memmove(bits.value, data, len(data))
+        previous = _ov_gdi.SelectObject(memory, bitmap)
+        blend = _BlendFunction(0, 0, 255, 1)  # AC_SRC_OVER, per-pixel alpha
+        ok = _ov_api.UpdateLayeredWindow(hwnd, screen, ctypes.byref(wintypes.POINT(x, y)),
+                                         ctypes.byref(wintypes.SIZE(w, h)), memory,
+                                         ctypes.byref(wintypes.POINT(0, 0)), 0, ctypes.byref(blend), ULW_ALPHA_)
+        _ov_gdi.SelectObject(memory, previous)
+        return bool(ok)
+    finally:
+        if bitmap:
+            _ov_gdi.DeleteObject(bitmap)
+        _ov_gdi.DeleteDC(memory)
+        _ov_api.ReleaseDC(None, screen)
+
+
+OVERLAY_DEFAULTS = {"bg": "glass", "size": "small", "low": True, "graph": True, "gpu": True, "cpu": True,
+                    "ping": True}
+OVERLAY_BACKGROUNDS = [("clear", "Clear"), ("glass", "Glass"), ("solid", "Solid")]
+OVERLAY_ITEMS = [("low", "1% low"), ("graph", "Frame-time graph"), ("gpu", "GPU"), ("cpu", "CPU"), ("ping", "Ping")]
+
+
+def _overlay_font(size: int, variation: bytes):
+    for name in ("bahnschrift.ttf", "segoeuib.ttf" if b"Bold" in variation else "segoeui.ttf"):
+        try:
+            font = ImageFont.truetype(os.path.join(SYSTEM_ROOT, "Fonts", name), size)
+        except OSError:
+            continue
+        try:
+            font.set_variation_by_name(variation)
+        except Exception:
+            pass
+        return font
+    return ImageFont.load_default()
+
+
+class OverlayRenderer:
+    """Draws the in-game strip: value + small unit pairs in fixed-width slots (so nothing jitters
+    as numbers change), with a frame-time trace after the FPS where stutter shows as a spike."""
+
+    def __init__(self, scale: float, style: dict):
+        self.style = dict(OVERLAY_DEFAULTS, **(style or {}))
+        k = scale * (1.3 if self.style["size"] == "large" else 1.0)
+        self.k = k
+        self.f_value = _overlay_font(max(9, round(14 * k)), b"SemiBold")
+        self.f_unit = _overlay_font(max(8, round(11 * k)), b"SemiCondensed")
+        self.h = round(22 * k)
+        self.pad, self.gap, self.unit_gap = round(9 * k), round(10 * k), round(3 * k)
+        self.graph_w, self.graph_h = round(46 * k), round(12 * k)
+
+    def _w(self, font, text: str) -> int:
+        return math.ceil(font.getlength(text))
+
+    def segments(self, d: dict) -> list:
+        """(kind, value, unit, slot text, warn) in display order; 'graph' is its own kind."""
+        st, out = self.style, []
+        fps, low = d.get("fps"), d.get("low")
+        out.append(("pair", "–" if fps is None else f"{fps:.0f}", "fps", "000", False))
+        if st["graph"]:
+            out.append(("graph", None, None, None, False))
+        if st["low"]:
+            out.append(("pair", "–" if low is None else f"{low:.0f}", "low", "000",
+                        low is not None and fps is not None and low < fps * 0.5))
+        if st["gpu"]:
+            load, temp = d.get("gpu_load"), d.get("gpu_temp")
+            out.append(("pair", "–" if load is None else f"{load:.0f}%", "gpu", "00%", False))
+            if temp is not None:
+                out.append(("tight", f"{temp:.0f}°", "", "00°", temp >= 85))  # sits with its gpu reading
+        if st["cpu"]:
+            cpu = d.get("cpu")
+            out.append(("pair", "–" if cpu is None else f"{cpu:.0f}%", "cpu", "00%", False))
+        if st["ping"] and d.get("ping") is not None:
+            out.append(("pair", f"{d['ping']:.0f}", "ms", "00", d["ping"] >= 80))
+        return out
+
+    def render(self, d: dict) -> Image.Image:
+        segs = self.segments(d)
+        widths, slots = [], []
+        for kind, value, unit, slot, _warn in segs:
+            if kind == "graph":
+                widths.append(self.graph_w)
+                slots.append(0)
+            else:
+                slot_w = max(self._w(self.f_value, slot), self._w(self.f_value, value))
+                slots.append(slot_w)
+                widths.append(slot_w + (self.unit_gap + self._w(self.f_unit, unit) if unit else 0))
+        gaps = [self.unit_gap * 2 if kind == "tight" else self.gap for kind, *_r in segs[1:]]
+        w = self.pad * 2 + sum(widths) + sum(gaps)
+        h = self.h
+        bg = self.style["bg"]
+        img = Image.new("RGBA", (w, h), (0, 0, 0, 1))  # alpha 1: invisible but still grabbable to drag
+        if bg != "clear":
+            fill = (0, 0, 0, 120) if bg == "glass" else (10, 10, 10, 225)
+            panel = Image.new("RGBA", (w, h), (0, 0, 0, 0))
+            ImageDraw.Draw(panel).rounded_rectangle((0, 0, w - 1, h - 1), radius=round(5 * self.k), fill=fill,
+                                                   outline=(255, 255, 255, 26 if bg == "solid" else 0))
+            img = Image.alpha_composite(img, panel)
+        text = Image.new("RGBA", (w, h), (0, 0, 0, 0))
+        draw = ImageDraw.Draw(text)
+        baseline = round(h * 0.73)
+        x = self.pad
+        for i, ((kind, value, unit, slot, warn), seg_w, slot_w) in enumerate(zip(segs, widths, slots)):
+            if i:
+                x += gaps[i - 1]
+            if kind == "graph":
+                self._graph(text, x, (h - self.graph_h) // 2, d.get("frames") or [])
+            else:
+                colour = hex_rgb(WARN_YELLOW) + (255,) if warn else (255, 255, 255, 255)
+                draw.text((x + slot_w - self._w(self.f_value, value), baseline), value, font=self.f_value,
+                          fill=colour, anchor="ls")
+                if unit:
+                    draw.text((x + slot_w + self.unit_gap, baseline), unit, font=self.f_unit,
+                              fill=(255, 255, 255, 140), anchor="ls")
+            x += seg_w
+        if bg != "solid":  # a soft dark halo keeps white text readable over bright scenes
+            alpha = text.getchannel("A").filter(ImageFilter.MaxFilter(3)).filter(ImageFilter.GaussianBlur(1.1 * self.k))
+            halo = Image.new("RGBA", (w, h), (0, 0, 0, 0))
+            halo.putalpha(alpha.point(lambda v: int(v * (0.85 if bg == "clear" else 0.5))))
+            img = Image.alpha_composite(img, halo)
+        return Image.alpha_composite(img, text)
+
+    def _graph(self, layer: Image.Image, x0: int, y0: int, frames: list) -> None:
+        frames = [f for f in frames[-90:] if f > 0]
+        gw, gh = self.graph_w, self.graph_h
+        ss = 3
+        big = Image.new("RGBA", (gw * ss, gh * ss), (0, 0, 0, 0))
+        draw = ImageDraw.Draw(big)
+        draw.line((0, gh * ss - 1, gw * ss, gh * ss - 1), fill=(255, 255, 255, 46), width=ss)  # baseline
+        if len(frames) >= 2:
+            median = sorted(frames)[len(frames) // 2]
+            top = max(median * 1.8, median + 6)
+            spike = max(2 * median, median + 8)
+            step = gw * ss / (len(frames) - 1)
+            points = [(i * step, (gh * ss - 2) - min(1.0, f / top) * (gh * ss - 3)) for i, f in enumerate(frames)]
+            for i in range(1, len(points)):
+                hot = frames[i] > spike or frames[i - 1] > spike
+                colour = hex_rgb(WARN_YELLOW) + (255,) if hot else (255, 255, 255, 215)
+                draw.line((points[i - 1], points[i]), fill=colour, width=round(1.4 * ss * self.k))
+        layer.alpha_composite(big.resize((gw, gh), Image.Resampling.LANCZOS), (x0, y0))
 
 
 class OverlayWindow:
-    """Small always-on-top box with live FPS, 1% low, GPU and ping. It never takes focus from the
-    game (WS_EX_NOACTIVATE) and stays off the taskbar. Drag to move, right-click to hide."""
-
-    W, H = 248, 64
-    KEY = "#010203"  # transparent colour, so the box keeps its rounded corners
+    """The in-game strip as a layered window: real per-pixel transparency, never takes focus
+    (WS_EX_NOACTIVATE), no taskbar button. Drag to move; right-click for options."""
 
     def __init__(self, app: "OptimizerApp"):
         self.app = app
-        px = app.px
         top = self.top = tk.Toplevel(app)
         top.withdraw()
         top.overrideredirect(True)
-        top.configure(bg=self.KEY)
         top.attributes("-topmost", True)
-        top.attributes("-alpha", 0.94)
-        top.attributes("-transparentcolor", self.KEY)
-        c = self.canvas = tk.Canvas(top, width=px(self.W), height=px(self.H), bg=self.KEY, highlightthickness=0, bd=0)
-        c.pack()
-        panel = app.painter.shape(px(self.W), px(self.H), px(12), fill=rgba(SURFACE, 248),
-                                  border=(255, 255, 255, 46), border_width=1.0)
-        self.photo = ImageTk.PhotoImage(panel)
-        c.create_image(0, 0, anchor="nw", image=self.photo)
-        self.t_fps = c.create_text(px(16), px(28), anchor="w", font=app.f_hero, fill=TEXT_HI, text="–")
-        self.t_unit = c.create_text(px(16), px(51), anchor="w", font=app.f_label, fill=TEXT_MID, text="FPS")
-        self.t_lines = [c.create_text(px(96), px(15 + i * 17), anchor="w", font=app.f_label, fill=TEXT_HI)
-                        for i in range(3)]
-        for seq, handler in (("<ButtonPress-1>", self._press), ("<B1-Motion>", self._drag),
-                             ("<ButtonRelease-1>", self._release), ("<Button-3>", lambda _e: app._toggle_overlay(False))):
-            c.bind(seq, handler)
-        self._grab = (0, 0)
         self.visible = False
+        self._grab = (0, 0)
+        self._last = {}
         pos = app._setting("overlay_pos")
-        x, y = (pos if isinstance(pos, list) and len(pos) == 2 else (px(24), px(24)))
-        top.geometry(f"+{int(x)}+{int(y)}")
+        self.x, self.y = (int(pos[0]), int(pos[1])) if isinstance(pos, list) and len(pos) == 2 else (app.px(20),
+                                                                                                    app.px(20))
+        self.renderer = OverlayRenderer(app.scale, self.style())
+        top.geometry(f"10x10+{self.x}+{self.y}")
         top.update_idletasks()
-        try:  # no focus stealing, no taskbar button
-            hwnd = _ov_api.GetParent(top.winfo_id()) or top.winfo_id()
-            style = _ov_api.GetWindowLongW(hwnd, GWL_EXSTYLE_I)
-            _ov_api.SetWindowLongW(hwnd, GWL_EXSTYLE_I, style | WS_EX_TOPMOST_ | WS_EX_TOOLWINDOW_ | WS_EX_NOACTIVATE_)
-        except Exception:
-            pass
+        self.hwnd = _ov_api.GetParent(top.winfo_id()) or top.winfo_id()
+        style = _ov_api.GetWindowLongW(self.hwnd, GWL_EXSTYLE_I)
+        _ov_api.SetWindowLongW(self.hwnd, GWL_EXSTYLE_I,
+                               style | WS_EX_LAYERED_ | WS_EX_TOPMOST_ | WS_EX_TOOLWINDOW_ | WS_EX_NOACTIVATE_)
+        for seq, handler in (("<ButtonPress-1>", self._press), ("<B1-Motion>", self._drag),
+                             ("<ButtonRelease-1>", self._release), ("<Button-3>", self._menu)):
+            top.bind(seq, handler)
+
+    def style(self) -> dict:
+        saved = self.app._setting("overlay_style")
+        return dict(OVERLAY_DEFAULTS, **(saved if isinstance(saved, dict) else {}))
+
+    def set_style(self, key: str, value) -> None:
+        style = self.style()
+        style[key] = value
+        self.app._set_setting("overlay_style", style)
+        self.renderer = OverlayRenderer(self.app.scale, style)
+        self.update(self._last)
+
+    def _menu(self, event) -> None:
+        style = self.style()
+        menu = tk.Menu(self.top, tearoff=0)
+        bg_var = tk.StringVar(self.top, style["bg"])
+        size_var = tk.StringVar(self.top, style["size"])
+        for value, label in OVERLAY_BACKGROUNDS:
+            menu.add_radiobutton(label=f"{label} background", value=value, variable=bg_var,
+                                 command=lambda v=value: self.set_style("bg", v))
+        menu.add_separator()
+        for value, label in (("small", "Small"), ("large", "Large")):
+            menu.add_radiobutton(label=label, value=value, variable=size_var,
+                                 command=lambda v=value: self.set_style("size", v))
+        menu.add_separator()
+        self._vars = []
+        for key, label in OVERLAY_ITEMS:
+            var = tk.BooleanVar(self.top, bool(style[key]))
+            self._vars.append(var)
+            menu.add_checkbutton(label=label, variable=var, command=lambda k=key, v=var: self.set_style(k, v.get()))
+        menu.add_separator()
+        menu.add_command(label=f"Hide overlay  ({OVERLAY_HOTKEY_LABEL})", command=lambda: self.app._toggle_overlay(False))
+        try:
+            menu.tk_popup(event.x_root, event.y_root)
+        finally:
+            menu.grab_release()
 
     def _press(self, event) -> None:
-        self._grab = (event.x_root - self.top.winfo_x(), event.y_root - self.top.winfo_y())
+        self._grab = (event.x_root - self.x, event.y_root - self.y)
 
     def _drag(self, event) -> None:
-        self.top.geometry(f"+{event.x_root - self._grab[0]}+{event.y_root - self._grab[1]}")
+        self.x, self.y = event.x_root - self._grab[0], event.y_root - self._grab[1]
+        self._push(self._image)
 
     def _release(self, _event) -> None:
-        self.app._set_setting("overlay_pos", [self.top.winfo_x(), self.top.winfo_y()])
+        self.app._set_setting("overlay_pos", [self.x, self.y])
+
+    def _push(self, image: Image.Image) -> None:
+        self._image = image
+        w, h = image.size
+        self.top.geometry(f"{w}x{h}+{self.x}+{self.y}")
+        push_layered(self.hwnd, image, self.x, self.y)
 
     def show(self) -> None:
         self.top.deiconify()
-        self.top.attributes("-topmost", True)
-        self.top.lift()
         self.visible = True
+        self.update(self._last)
 
     def hide(self) -> None:
         self.top.withdraw()
         self.visible = False
 
     def update(self, data: dict) -> None:
-        c = self.canvas
-        fps, low = data.get("fps"), data.get("low")
-        c.itemconfigure(self.t_fps, text="–" if fps is None else f"{fps:.0f}")
-        temp, load, cpu, ping = data.get("gpu_temp"), data.get("gpu_load"), data.get("cpu"), data.get("ping")
-        gpu = "GPU  –" if load is None else f"GPU  {load:.0f}%"
-        if temp is not None:
-            gpu += f"  ·  {temp:.0f} °C"
-        last = "CPU  –" if cpu is None else f"CPU  {cpu:.0f}%"
-        if ping is not None:
-            last += f"  ·  Ping {ping:.0f} ms"
-        lines = ["1% low  –" if low is None else f"1% low  {low:.0f}", gpu, last]
-        for item, text in zip(self.t_lines, lines):
-            c.itemconfigure(item, text=text)
+        self._last = data or {}
+        if self.visible:
+            self._push(self.renderer.render(self._last))
 
     def destroy(self) -> None:
         try:
@@ -7746,13 +7946,14 @@ class OptimizerApp(ctk.CTk):
         self._tray_refresh()
 
     def _overlay_data(self) -> dict:
-        live = None
+        live, frames = None, []
         for session in self.sessions_live.values():
             capture = session.get("capture")
             if capture is not None:
                 live = capture.live() or live
+                frames = capture.recent_frames(90) or frames
         gpu = self._last_tel.get("gpu") or {}
-        return {"fps": live[0] if live else None, "low": live[1] if live else None,
+        return {"fps": live[0] if live else None, "low": live[1] if live else None, "frames": frames,
                 "gpu_temp": gpu.get("temp"), "gpu_load": gpu.get("load"), "cpu": self._last_tel.get("cpu"),
                 "ping": self._last_ping if self.sessions_live else None}
 
