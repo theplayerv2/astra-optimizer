@@ -4968,6 +4968,10 @@ _ov_api.UpdateLayeredWindow.argtypes = [wintypes.HWND, wintypes.HDC, ctypes.POIN
                                         ctypes.POINTER(wintypes.SIZE), wintypes.HDC, ctypes.POINTER(wintypes.POINT),
                                         wintypes.DWORD, ctypes.c_void_p, wintypes.DWORD]
 _ov_api.UpdateLayeredWindow.restype = wintypes.BOOL
+_ov_api.GetForegroundWindow.argtypes, _ov_api.GetForegroundWindow.restype = [], wintypes.HWND
+_ov_api.SetForegroundWindow.argtypes, _ov_api.SetForegroundWindow.restype = [wintypes.HWND], wintypes.BOOL
+_ov_api.GetSystemMetrics.argtypes, _ov_api.GetSystemMetrics.restype = [ctypes.c_int], ctypes.c_int
+_ov_api.EndMenu.argtypes, _ov_api.EndMenu.restype = [], wintypes.BOOL
 _ov_gdi = ctypes.WinDLL("gdi32")
 _ov_gdi.CreateCompatibleDC.argtypes, _ov_gdi.CreateCompatibleDC.restype = [wintypes.HDC], wintypes.HDC
 _ov_gdi.CreateDIBSection.argtypes = [wintypes.HDC, ctypes.c_void_p, wintypes.UINT, ctypes.POINTER(ctypes.c_void_p),
@@ -5017,7 +5021,7 @@ def push_layered(hwnd: int, image: Image.Image, x: int, y: int) -> bool:
 
 
 OVERLAY_DEFAULTS = {"bg": "glass", "size": "small", "low": True, "graph": True, "gpu": True, "cpu": True,
-                    "ping": True}
+                    "ping": True, "locked": False}
 OVERLAY_BACKGROUNDS = [("clear", "Clear"), ("glass", "Glass"), ("solid", "Solid")]
 OVERLAY_ITEMS = [("low", "1% low"), ("graph", "Frame-time graph"), ("gpu", "GPU"), ("cpu", "CPU"), ("ping", "Ping")]
 
@@ -5152,11 +5156,18 @@ class OverlayWindow:
         top.overrideredirect(True)
         top.attributes("-topmost", True)
         self.visible = False
+        self.menu_open = False
         self._grab = (0, 0)
         self._last = {}
         pos = app._setting("overlay_pos")
         self.x, self.y = (int(pos[0]), int(pos[1])) if isinstance(pos, list) and len(pos) == 2 else (app.px(20),
                                                                                                     app.px(20))
+        # Keep it reachable if the monitor it was on is gone (virtual screen = all monitors together).
+        vx, vy = _ov_api.GetSystemMetrics(76), _ov_api.GetSystemMetrics(77)
+        vw, vh = _ov_api.GetSystemMetrics(78), _ov_api.GetSystemMetrics(79)
+        if vw > 0 and vh > 0:
+            self.x = min(max(self.x, vx), vx + vw - app.px(60))
+            self.y = min(max(self.y, vy), vy + vh - app.px(24))
         self.renderer = OverlayRenderer(app.scale, self.style())
         top.geometry(f"10x10+{self.x}+{self.y}")
         top.update_idletasks()
@@ -5182,6 +5193,10 @@ class OverlayWindow:
     def _menu(self, event) -> None:
         style = self.style()
         menu = tk.Menu(self.top, tearoff=0)
+        lock_var = tk.BooleanVar(self.top, bool(style["locked"]))
+        menu.add_checkbutton(label="Lock position", variable=lock_var,
+                             command=lambda: self.set_style("locked", lock_var.get()))
+        menu.add_separator()
         bg_var = tk.StringVar(self.top, style["bg"])
         size_var = tk.StringVar(self.top, style["size"])
         for value, label in OVERLAY_BACKGROUNDS:
@@ -5199,20 +5214,47 @@ class OverlayWindow:
             menu.add_checkbutton(label=label, variable=var, command=lambda k=key, v=var: self.set_style(k, v.get()))
         menu.add_separator()
         menu.add_command(label=f"Hide overlay  ({OVERLAY_HOTKEY_LABEL})", command=lambda: self.app._toggle_overlay(False))
+        # Windows only closes a popup menu on a click outside it while the menu's window is in the
+        # foreground, and the overlay normally never is (it doesn't take focus). So it may take focus
+        # just while the menu is open, then the game gets it back.
+        previous = _ov_api.GetForegroundWindow()
+        style_bits = _ov_api.GetWindowLongW(self.hwnd, GWL_EXSTYLE_I)
+        _ov_api.SetWindowLongW(self.hwnd, GWL_EXSTYLE_I, style_bits & ~WS_EX_NOACTIVATE_)
+        _ov_api.SetForegroundWindow(self.hwnd)
+        self.menu_open, self._menu_widget = True, menu
+        if _ov_api.GetForegroundWindow() == self.hwnd:
+            self.top.after(150, self._watch_menu)  # backup: close it if focus goes anywhere else
         try:
-            menu.tk_popup(event.x_root, event.y_root)
+            menu.tk_popup(event.x_root, event.y_root)  # returns once the menu has closed
         finally:
+            self.menu_open = False
             menu.grab_release()
+            _ov_api.SetWindowLongW(self.hwnd, GWL_EXSTYLE_I, style_bits)
+            if previous and previous != self.hwnd:
+                _ov_api.SetForegroundWindow(previous)
+
+    def _watch_menu(self) -> None:
+        """While the menu is open (Tk keeps running timers during it): if another window got focus,
+        for example the game after a click outside, close the menu."""
+        if not self.menu_open:
+            return
+        if _ov_api.GetForegroundWindow() not in (self.hwnd, None):
+            _ov_api.EndMenu()
+            return
+        self.top.after(150, self._watch_menu)
 
     def _press(self, event) -> None:
         self._grab = (event.x_root - self.x, event.y_root - self.y)
 
     def _drag(self, event) -> None:
+        if self.renderer.style["locked"]:
+            return
         self.x, self.y = event.x_root - self._grab[0], event.y_root - self._grab[1]
         self._push(self._image)
 
     def _release(self, _event) -> None:
-        self.app._set_setting("overlay_pos", [self.x, self.y])
+        if not self.renderer.style["locked"]:
+            self.app._set_setting("overlay_pos", [self.x, self.y])  # reopens here, even after a restart
 
     def _push(self, image: Image.Image) -> None:
         self._image = image

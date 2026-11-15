@@ -17,8 +17,8 @@ When a version is tagged on GitHub (for example `v1.2.0`), its section below bec
 - **Live overlay:** a slim one-line strip with live FPS, a frame-time graph where stutter shows as a spike, 1% low,
   GPU load and temperature, CPU and ping; values that need attention turn yellow. It opens when a game from your list
   starts and closes with it, Ctrl+Alt+F or the tray menu toggles it any time, and it never takes focus from the game.
-  Drag it anywhere. Right-click it to choose a Clear, Glass or Solid background (real transparency), Small or Large
-  size, and which readings to show. Shows over borderless and windowed games.
+  Drag it anywhere (it reopens in the same place) and lock it there. Right-click it to choose a Clear, Glass or Solid
+  background (real transparency), Small or Large size, and which readings to show. Shows over borderless and windowed games.
 - **NVIDIA driver settings:** Max FPS sets power management to "Prefer maximum performance" and Low Latency Mode to
   On; Cozy turns on Low Latency Mode. They're changed through NVIDIA's driver API (the same settings as the NVIDIA
   Control Panel's global profile) and Undo puts back your exact previous values.
