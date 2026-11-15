@@ -1,0 +1,33 @@
+# Every push to main (and every pull request) builds the exe, so a broken build shows up before a
+# release does. The exe is kept for 14 days under the run's "Artifacts".
+name: Build
+
+on:
+  push:
+    branches: [main]
+    paths-ignore: ["**.md", "docs/**", "LICENSE"]
+  pull_request:
+    paths-ignore: ["**.md", "docs/**", "LICENSE"]
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Build Astra Optimizer.exe
+        shell: cmd
+        run: build.bat --nopause
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: Astra-Optimizer-${{ github.sha }}
+          path: dist/Astra Optimizer.exe
+          retention-days: 14

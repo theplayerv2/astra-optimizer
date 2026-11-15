@@ -9,6 +9,11 @@
 </p>
 
 <p align="center">
+  <a href="../../releases/latest"><img src="https://img.shields.io/github/v/release/theplayerv2/astra-optimizer?label=download" alt="Latest release"></a>
+  <a href="../../actions/workflows/build.yml"><img src="https://github.com/theplayerv2/astra-optimizer/actions/workflows/build.yml/badge.svg" alt="Build status"></a>
+</p>
+
+<p align="center">
   <img src="docs/screenshots/boost.png" width="720" alt="Astra Optimizer, Boost tab">
 </p>
 
@@ -61,8 +66,11 @@ Six switches for ads and tracking built into Windows: ads and suggested apps in 
 
 ## Download
 
-Get **Astra Optimizer.exe** from the [Releases](../../releases) page and run it. It needs administrator
-rights, so Windows asks once (UAC). Without them it still opens, but only to monitor.
+Get **Astra.Optimizer.exe** from the [latest release](../../releases/latest) and run it. It needs
+administrator rights, so Windows asks once (UAC). Without them it still opens, but only to monitor.
+
+Every release is built by GitHub Actions straight from that version's source code, and its notes list
+the exe's SHA-256 checksum. What changed in each version is in [CHANGELOG.md](CHANGELOG.md).
 
 When a newer version comes out, the About tab shows a **Download** button that opens its release page.
 Astra Optimizer only checks; it never downloads or installs anything by itself, and you can turn the
@@ -89,6 +97,21 @@ python -m venv .venv
 .venv\Scripts\pip install -r requirements.txt
 .venv\Scripts\python optimizer.py
 ```
+
+### Making a release
+
+1. Set `APP_VERSION` and `DISPLAY_VERSION` at the top of `optimizer.py` (for example `1.3.0` and `v1.3`).
+2. Add a `## v1.3 - YYYY-MM-DD` section to `CHANGELOG.md`.
+3. Commit, then tag and push:
+
+   ```bat
+   git tag v1.3
+   git push origin main v1.3
+   ```
+
+GitHub Actions builds the exe on a clean Windows machine and publishes the release with the changelog
+section as its notes. The run stops before publishing if the tag doesn't match `DISPLAY_VERSION` or the
+changelog has no section for it. Every push to `main` is also built, so a broken build shows up early.
 
 ## Where your data lives
 

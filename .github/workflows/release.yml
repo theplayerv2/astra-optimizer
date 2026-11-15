@@ -1,0 +1,54 @@
+# Push a version tag (for example `git tag v1.2` then `git push origin v1.2`) and this builds
+# Astra Optimizer.exe on a clean Windows machine and publishes it as a GitHub release, with that
+# version's CHANGELOG.md section as the notes.
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write  # create the release and upload the exe
+
+jobs:
+  release:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Check the version and the changelog
+        run: python tools/release_notes.py "${{ github.ref_name }}" release-notes.md
+
+      - name: Build Astra Optimizer.exe
+        shell: cmd
+        run: build.bat --nopause
+
+      - name: Checksum and final notes
+        shell: pwsh
+        run: |
+          $exe = "dist\Astra Optimizer.exe"
+          $hash = (Get-FileHash $exe -Algorithm SHA256).Hash
+          Set-Content -Path dist\SHA256.txt -Value $hash -Encoding ascii
+          python tools/release_notes.py "${{ github.ref_name }}" release-notes.md --checksum dist\SHA256.txt
+          Copy-Item $exe "dist\Astra.Optimizer.exe"
+          "Built {0:N1} MB, SHA-256 {1}" -f ((Get-Item $exe).Length / 1MB), $hash
+
+      - name: Publish the release
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $tag = "${{ github.ref_name }}"
+          gh release view $tag *> $null
+          if ($LASTEXITCODE -eq 0) {
+            # A release made by hand for this tag: replace its exe and notes.
+            gh release upload $tag "dist\Astra.Optimizer.exe" --clobber
+            gh release edit $tag --notes-file release-notes.md
+          } else {
+            gh release create $tag "dist\Astra.Optimizer.exe" --title "Astra Optimizer $tag" --notes-file release-notes.md --verify-tag
+          }
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
