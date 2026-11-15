@@ -56,8 +56,8 @@ except Exception:  # pragma: no cover - depends on the build
 
 APP_NAME = "Astra Optimizer"
 LEGACY_APP_NAME = "Optimizer"  # pre-1.12 name: data folder and startup task are carried over
-APP_VERSION = "1.1.0"
-DISPLAY_VERSION = "v1.1"
+APP_VERSION = "1.2.0"
+DISPLAY_VERSION = "v1.2"
 CREDIT_NAME = "theplayerv2"
 CREDIT_URL = "https://guns.lol/playerv2"
 UPDATE_REPO = "theplayerv2/astra-optimizer"
@@ -1930,7 +1930,8 @@ INSTANCE_EVENT = "Local\\AstraOptimizerShowWindow"
 EVENT_MODIFY_STATE = 0x0002
 SW_RESTORE = 9
 DEFAULT_SETTINGS = {"tray": True, "autostart": False, "hotkey": True, "custom_host": "", "tray_hint": False,
-                    "preview": True, "games": [], "game_auto": False, "clean_skip": [], "dns_original": None,
+                    "preview": True, "games": [], "game_auto": False, "clean_skip": [], "clean_weekly": False, "clean_at": 0,
+                    "dns_original": None,
                     "restore_point": True, "restore_point_at": 0, "updates": True, "sessions": []}
 
 
@@ -2258,6 +2259,40 @@ def set_process_priority(pid: int, high: bool) -> str | None:
         return str(exc)
 
 
+class _PowerThrottlingState(ctypes.Structure):
+    _fields_ = [("Version", wintypes.ULONG), ("ControlMask", wintypes.ULONG), ("StateMask", wintypes.ULONG)]
+
+
+_proc_api = ctypes.WinDLL("kernel32", use_last_error=True)  # private function objects for these argtypes
+_proc_api.SetProcessInformation.argtypes = [wintypes.HANDLE, ctypes.c_int, ctypes.c_void_p, wintypes.DWORD]
+_proc_api.SetProcessInformation.restype = wintypes.BOOL
+_proc_api.OpenProcess.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
+_proc_api.OpenProcess.restype = wintypes.HANDLE
+PROCESS_SET_INFORMATION = 0x0200
+PROCESS_POWER_THROTTLING_EXECUTION_SPEED = 0x1
+PROCESS_POWER_THROTTLING_IGNORE_TIMER_RESOLUTION = 0x4
+
+
+def disable_power_throttling(pid: int) -> bool:
+    """Opt a game out of Windows' power throttling (EcoQoS), so it isn't slowed down to save power
+    and its timer requests are honoured even when it's in the background. Lasts until it exits."""
+    try:
+        handle = _proc_api.OpenProcess(PROCESS_SET_INFORMATION, False, pid)
+    except Exception:
+        return False
+    if not handle:
+        return False
+    try:
+        for mask in (PROCESS_POWER_THROTTLING_EXECUTION_SPEED | PROCESS_POWER_THROTTLING_IGNORE_TIMER_RESOLUTION,
+                     PROCESS_POWER_THROTTLING_EXECUTION_SPEED):  # the timer flag needs Windows 11
+            state = _PowerThrottlingState(1, mask, 0)  # control these, state 0 = never throttle
+            if _proc_api.SetProcessInformation(handle, 4, ctypes.byref(state), ctypes.sizeof(state)):
+                return True
+        return False
+    finally:
+        kernel32.CloseHandle(handle)
+
+
 class GameWatcher(threading.Thread):
     """Checks running processes every 2 s for the user's games, raises their priority when they
     start, and reports starts/stops to the UI queue."""
@@ -2305,7 +2340,8 @@ class GameWatcher(threading.Thread):
             if pid not in self.running:
                 wanted = games.get(exe, False)
                 error = set_process_priority(pid, True) if wanted else None
-                self.out_queue.put(("game-start", pid, exe, wanted, error))
+                unthrottled = disable_power_throttling(pid)
+                self.out_queue.put(("game-start", pid, exe, wanted, error, unthrottled))
         for pid, exe in self.running.items():
             if pid not in seen:
                 self.out_queue.put(("game-stop", pid, exe))
@@ -2727,18 +2763,29 @@ def set_startup_enabled(item: dict, enabled: bool) -> None:
 # --------------------------------------------------------------------------------------
 
 CLEAN_MIN_AGE = 24 * 3600  # only files untouched for a day
+CLEAN_WEEK = 7 * 24 * 3600
 
 
 def clean_targets() -> list[tuple[str, str, str, list[str]]]:
     temp = os.environ.get("TEMP") or os.environ.get("TMP") or ""
     programdata = os.environ.get("ProgramData") or r"C:\ProgramData"
     wer = os.path.join(programdata, r"Microsoft\Windows\WER")
+    appdata = os.environ.get("APPDATA") or ""
+    discord = [os.path.join(appdata, app, sub) for app in ("discord", "discordptb", "discordcanary")
+               for sub in (r"Cache\Cache_Data", "Code Cache", "GPUCache")] if appdata else []
     return [
         ("user", "Your temp folder", "Leftovers from installers, updaters and apps", [temp] if temp else []),
         ("windows", "Windows temp folder", "Leftovers from Windows and system services",
          [os.path.join(SYSTEM_ROOT, "Temp")]),
         ("crash", "Crash reports", "Saved Windows Error Reporting files",
          [os.path.join(wer, "ReportArchive"), os.path.join(wer, "ReportQueue")]),
+        ("discord", "Discord cache", "Cached images and code. Discord fetches what it needs again", discord),
+        ("update", "Windows Update downloads", "Update files Windows already used. It re-downloads anything it needs",
+         [os.path.join(SYSTEM_ROOT, r"SoftwareDistribution\Download")]),
+        ("delivery", "Delivery Optimization cache", "Update pieces Windows keeps to share with other PCs",
+         [os.path.join(SYSTEM_ROOT, r"ServiceProfiles\NetworkService\AppData\Local\Microsoft\Windows"
+                                    r"\DeliveryOptimization\Cache"),
+          os.path.join(SYSTEM_ROOT, r"SoftwareDistribution\DeliveryOptimization")]),
     ]
 
 
@@ -3134,6 +3181,108 @@ def run_checkup() -> dict[str, dict]:
 
 
 # --------------------------------------------------------------------------------------
+# Privacy: ads and tracking built into Windows. Each switch saves the exact values it
+# replaces and writes them back when turned off (a value that didn't exist is deleted again).
+# --------------------------------------------------------------------------------------
+
+_CDM = r"Software\Microsoft\Windows\CurrentVersion\ContentDeliveryManager"
+PRIVACY_ITEMS = [
+    ("ads", "Block ads in Start and Settings",
+     "Stops suggested apps, promotions and apps Windows installs by itself.",
+     [("HKCU", _CDM, "SystemPaneSuggestionsEnabled", 0), ("HKCU", _CDM, "SubscribedContent-338388Enabled", 0),
+      ("HKCU", _CDM, "SubscribedContent-338393Enabled", 0), ("HKCU", _CDM, "SubscribedContent-353694Enabled", 0),
+      ("HKCU", _CDM, "SubscribedContent-353696Enabled", 0), ("HKCU", _CDM, "SilentInstalledAppsEnabled", 0),
+      ("HKCU", r"Software\Microsoft\Windows\CurrentVersion\Explorer\Advanced", "Start_IrisRecommendations", 0)]),
+    ("search", "Keep Start search on this PC",
+     "No Bing web results when you search from Start. Shows after you sign in again.",
+     [("HKCU", r"Software\Policies\Microsoft\Windows\Explorer", "DisableSearchBoxSuggestions", 1),
+      ("HKCU", r"Software\Microsoft\Windows\CurrentVersion\Search", "BingSearchEnabled", 0)]),
+    ("adid", "Turn off the advertising ID", "Apps can't use it to show you personalised ads.",
+     [("HKCU", r"Software\Microsoft\Windows\CurrentVersion\AdvertisingInfo", "Enabled", 0)]),
+    ("tips", "No tips and suggestions",
+     "Hides tip notifications, 'finish setting up' prompts and lock screen fun facts.",
+     [("HKCU", _CDM, "SubscribedContent-338389Enabled", 0), ("HKCU", _CDM, "SoftLandingEnabled", 0),
+      ("HKCU", _CDM, "SubscribedContent-310093Enabled", 0), ("HKCU", _CDM, "RotatingLockScreenOverlayEnabled", 0),
+      ("HKCU", _CDM, "SubscribedContent-338387Enabled", 0),
+      ("HKCU", r"Software\Microsoft\Windows\CurrentVersion\UserProfileEngagement", "ScoobeSystemSettingEnabled", 0)]),
+    ("telemetry", "Send only required diagnostic data",
+     "The minimum Windows allows. Its Settings app will say some options are managed.",
+     [("HKLM", r"SOFTWARE\Policies\Microsoft\Windows\DataCollection", "AllowTelemetry", 1),
+      ("HKCU", r"Software\Microsoft\Windows\CurrentVersion\Privacy",
+       "TailoredExperiencesWithDiagnosticDataEnabled", 0)]),
+    ("activity", "Turn off activity history", "Windows stops keeping a list of the apps and files you use.",
+     [("HKLM", r"SOFTWARE\Policies\Microsoft\Windows\System", "PublishUserActivities", 0),
+      ("HKLM", r"SOFTWARE\Policies\Microsoft\Windows\System", "UploadUserActivities", 0)]),
+]
+PRIVACY_KEYS = [key for key, *_rest in PRIVACY_ITEMS]
+
+
+def _reg_get(hive: str, path: str, name: str):
+    try:
+        with winreg.OpenKey(HIVES[hive], path, 0, winreg.KEY_READ | winreg.KEY_WOW64_64KEY) as key:
+            return winreg.QueryValueEx(key, name)  # (value, type)
+    except OSError:
+        return None
+
+
+def _reg_put(hive: str, path: str, name: str, value, kind: int = winreg.REG_DWORD) -> None:
+    with winreg.CreateKeyEx(HIVES[hive], path, 0, winreg.KEY_SET_VALUE | winreg.KEY_WOW64_64KEY) as key:
+        winreg.SetValueEx(key, name, 0, kind, value)
+
+
+def _reg_delete(hive: str, path: str, name: str) -> None:
+    try:
+        with winreg.OpenKey(HIVES[hive], path, 0, winreg.KEY_SET_VALUE | winreg.KEY_WOW64_64KEY) as key:
+            winreg.DeleteValue(key, name)
+    except FileNotFoundError:
+        pass
+
+
+def privacy_values(key: str) -> list[tuple]:
+    return next(values for k, _t, _d, values in PRIVACY_ITEMS if k == key)
+
+
+def privacy_needs_admin(key: str) -> bool:
+    return any(hive == "HKLM" for hive, *_rest in privacy_values(key))
+
+
+def privacy_is_on(key: str) -> bool:
+    """Live: every value it sets currently holds the private setting."""
+    for hive, path, name, target in privacy_values(key):
+        current = _reg_get(hive, path, name)
+        if current is None or current[0] != target:
+            return False
+    return True
+
+
+def privacy_apply(key: str, saved: list | None) -> list:
+    """Write the private values. Returns the originals to keep: the ones already saved, or the
+    values found now (None for a value that didn't exist)."""
+    values = privacy_values(key)
+    originals = saved
+    if not originals:
+        originals = []
+        for hive, path, name, _target in values:
+            current = _reg_get(hive, path, name)
+            originals.append([hive, path, name, None if current is None else current[0],
+                              None if current is None else current[1]])
+    for hive, path, name, target in values:
+        _reg_put(hive, path, name, target)
+    return originals
+
+
+def privacy_restore(key: str, saved: list | None) -> None:
+    """Put back exactly what was there. Without saved originals, removes the values this app sets,
+    which returns them to Windows' own default."""
+    entries = saved or [[hive, path, name, None, None] for hive, path, name, _t in privacy_values(key)]
+    for hive, path, name, value, kind in entries:
+        if value is None:
+            _reg_delete(hive, path, name)
+        else:
+            _reg_put(hive, path, name, value, kind if kind is not None else winreg.REG_DWORD)
+
+
+# --------------------------------------------------------------------------------------
 # Game session reports
 # --------------------------------------------------------------------------------------
 
@@ -3275,9 +3424,9 @@ L_BRAND_GLYPH = (14, 9, 20)
 L_WINDOW_BUTTONS = {"min": (640, 6, 32, 24), "close": (674, 6, 32, 24)}
 L_RAIL_W = 64                                   # side tab rail
 CX = 78                                         # content column: x 78..706
-TAB_ORDER = ["boost", "tools", "appearance", "settings", "about"]
-TAB_SPECS = {"boost": ("Boost", "comet"), "tools": ("Tools", "signal"), "appearance": ("Appearance", "contrast"),
-             "settings": ("Settings", "sliders"), "about": ("About", "info")}
+TAB_ORDER = ["boost", "tools", "privacy", "appearance", "settings", "about"]
+TAB_SPECS = {"boost": ("Boost", "comet"), "tools": ("Tools", "signal"), "privacy": ("Privacy", "shield"),
+             "appearance": ("Appearance", "contrast"), "settings": ("Settings", "sliders"), "about": ("About", "info")}
 L_ABOUT_ROWS = {"app": (78, 52, 628, 136), "credits": (78, 198, 628, 128), "info": (78, 336, 628, 130)}
 L_ABOUT_ICON = (100, 74, 92)          # x, y, size
 L_ABOUT_AVATAR = (100, 220, 84)
@@ -3285,7 +3434,7 @@ L_ABOUT_PROFILE = (546, 242, 140, 40)
 L_ABOUT_LINK = (204, 286, 150, 20)    # the link text itself is clickable too
 L_ABOUT_UPDATE = (546, 74, 140, 40)   # "Check for updates" / "Download v…"
 L_RAIL_BOX = (6, 44, 60, 422)                  # floating glass box holding the tabs
-L_TABS = {key: (9, 52 + i * 66, 54, 58) for i, key in enumerate(TAB_ORDER)}
+L_TABS = {key: (9, 52 + i * 69, 54, 58) for i, key in enumerate(TAB_ORDER)}
 # Boost tab
 L_PILLS = {"cpu": (78, 44, 104, 52), "gpu": (190, 44, 224, 52), "ram": (422, 44, 136, 52), "plan": (566, 44, 140, 52)}
 GPU_EXTRA_W = 118  # right-hand column of the GPU pill (VRAM, clock, power)
@@ -3304,7 +3453,8 @@ TOOL_PAGE_BUTTONS = {"checkup": {"checkup": L_TOOL_ACTION}, "ping": L_TOOL_BUTTO
                      "startup": {"refresh": L_TOOL_ACTION}, "cleanup": {"clean": L_TOOL_ACTION},
                      "dns": {"dnstest": L_TOOL_ACTION}, "monitor": {}}
 PRIMARY_TOOL_BUTTONS = {"ping", "clean", "dnstest", "checkup"}
-L_CHECK_ROWS = {key: (78, 100 + i * 73, 628, 66) for i, (key, _title) in enumerate(CHECKUP_ITEMS)}
+L_CHECK_ROWS = {key: (78, 128 + i * 68, 628, 62) for i, (key, _title) in enumerate(CHECKUP_ITEMS)}
+L_CHECK_SCORE = (78, 104, 18, 8)  # x, y, pip width, pip height: one pip per check above the rows
 L_CHECK_BTN = (112, 30)  # row action button, right-aligned in its row
 L_DNS_TABLE = (78, 100, 628, 280)
 L_DNS_ROW_Y0, L_DNS_ROW_H, DNS_ROWS = 134, 40, 6
@@ -3321,7 +3471,9 @@ L_GAME_COLS = {"name": 94, "prio": 466, "fso": 566, "del": 664}
 L_GAME_AUTO = (78, 424, 628, 42)
 L_START_ROW_Y0, L_START_ROW_H, START_ROWS = 134, 39, 7
 L_START_COLS = {"name": 94, "source": 446, "toggle": 646}
-L_CLEAN_ROWS = {key: (78, 100 + i * 70, 628, 62) for i, key in enumerate(("user", "windows", "crash"))}
+L_CLEAN_ROWS = {key: (78, 100 + i * 48, 628, 44)
+                for i, key in enumerate(("user", "windows", "crash", "discord", "update", "delivery"))}
+L_CLEAN_BAR = (78, 394, 628, 72)
 L_PING_TABLE = (78, 100, 628, 312)
 L_PING_ROW_Y0, L_PING_ROW_H = 134, 34
 L_PING_HOST_FIELD = (78, 424, 500, 42)
@@ -3335,6 +3487,10 @@ L_FOLDER_ROW = (78, 416, 628, 46)
 L_SETTING_BUTTONS = {"folder": (78 + 628 - 16 - 120, 416 + 4, 120, 38)}
 L_PROTECT_BUTTON = (78 + 628 - 20 - 44 - 16 - 104, L_SETTING_ROWS["restore"][1] + 9, 104, 30)  # "Turn on…"
 L_DIALOG_W = 404
+# Privacy tab (same row geometry as Settings)
+L_PRIV_ROWS = {key: (78, 96 + i * 53, 628, 48) for i, key in enumerate(PRIVACY_KEYS)}
+L_PRIV_FOOT = (78, 416, 628, 46)
+L_PRIV_ALL = (78 + 628 - 16 - 120, 416 + 4, 120, 38)
 # Appearance tab
 L_LOOK_RESET = (586, 50, 120, 36)
 L_LOOK_ROWS = {"background": (78, 100, 628, 88), "adjust": (78, 198, 628, 168), "motion": (78, 376, 628, 90)}
@@ -3666,6 +3822,12 @@ class GalaxyPainter:
             d.ellipse((12 * u, 12 * u, 88 * u, 88 * u), outline=rgba(STARLIGHT), width=max(1, int(7 * u)))
             d.ellipse((44 * u, 26 * u, 56 * u, 38 * u), fill=rgba(STARLIGHT))
             d.rounded_rectangle((44 * u, 45 * u, 56 * u, 74 * u), radius=5 * u, fill=rgba(STARLIGHT))
+        elif kind == "shield":
+            outline = [(50, 8), (86, 21), (86, 46), (80, 66), (66, 82), (50, 92), (34, 82), (20, 66), (14, 46),
+                       (14, 21)]
+            d.polygon([(x * u, y * u) for x, y in outline], outline=rgba(STARLIGHT), width=max(1, int(7 * u)))
+            d.ellipse((41 * u, 32 * u, 59 * u, 50 * u), fill=rgba(STARLIGHT))
+            d.polygon([(45 * u, 46 * u), (55 * u, 46 * u), (58 * u, 68 * u), (42 * u, 68 * u)], fill=rgba(STARLIGHT))
         elif kind == "contrast":
             d.ellipse((14 * u, 14 * u, 86 * u, 86 * u), outline=rgba(STARLIGHT), width=max(1, int(7 * u)))
             d.pieslice((14 * u, 14 * u, 86 * u, 86 * u), 90, 270, fill=rgba(STARLIGHT))
@@ -4162,6 +4324,9 @@ class OptimizerApp(ctk.CTk):
         self.checkup: dict[str, dict] = {}
         self.checkup_at = 0.0
         self.sessions_live: dict[str, dict] = {}
+        self.privacy_state: dict[str, bool] = {}
+        self._privacy_busy = False
+        self._privacy_defaults: list = []
         self.session_pinger: SessionPinger | None = None
         self.games: list[dict] = [dict(g) for g in (self._setting("games") or []) if isinstance(g, dict) and g.get("path")]
         self.game_offset = 0
@@ -4176,6 +4341,7 @@ class OptimizerApp(ctk.CTk):
         self.clean_scan: dict | None = None  # key -> (files, bytes)
         self.clean_scanned_at = 0.0
         self.clean_last: tuple[int, int, int] | None = None
+        self._clean_auto = False
         self.game_finder: dict | None = None  # {"state": "searching"|"ready", "items": [...]}
         self.dns_info: dict | None = None
         self.dns_state = "idle"               # idle | loading | testing | switching
@@ -4231,6 +4397,7 @@ class OptimizerApp(ctk.CTk):
         self.scene_photo = ImageTk.PhotoImage(self._scene.convert("RGB"))
         self.canvas.create_image(0, 0, anchor="nw", image=self.scene_photo)
         self._build_text()
+        self._refresh_privacy()
         cx, cy, cw, ch = L_CONSOLE
         inset = 6
         self.console = ConsoleView(self, self.px(cx + inset), self.px(cy + inset),
@@ -4472,11 +4639,13 @@ class OptimizerApp(ctk.CTk):
 
         settings = base.copy()
         rows(settings, [*L_SETTING_ROWS.values(), L_FOLDER_ROW])
+        privacy = base.copy()
+        rows(privacy, [*L_PRIV_ROWS.values(), L_PRIV_FOOT])
         appearance = base.copy()
         rows(appearance, L_LOOK_ROWS.values())
         rows(games, [L_GAME_AUTO])
         cleanup = base.copy()
-        rows(cleanup, L_CLEAN_ROWS.values())
+        rows(cleanup, [*L_CLEAN_ROWS.values(), L_CLEAN_BAR])
         checkup = base.copy()
         rows(checkup, L_CHECK_ROWS.values())
         rows(dns, [L_DNS_BAR])
@@ -4489,7 +4658,7 @@ class OptimizerApp(ctk.CTk):
 
         self.backdrops = {"boost": boost, "tools:checkup": checkup, "tools:ping": tools,"tools:games": games, "tools:startup": startup,
                           "tools:cleanup": cleanup, "tools:dns": dns, "tools:monitor": monitor,
-                          "appearance": appearance, "settings": settings, "about": self._about_backdrop(base, rows)}
+                          "appearance": appearance, "settings": settings, "privacy": privacy, "about": self._about_backdrop(base, rows)}
         for img in self.backdrops.values():
             # Hairline window edge (the native frame is gone).
             self._hairline(img, 0, 0, WINDOW_W, 1 / self.scale, 22)
@@ -4524,10 +4693,11 @@ class OptimizerApp(ctk.CTk):
     def _keep_clear(self) -> list:
         return [(0, 0, WINDOW_W, L_TITLE_H), L_RAIL_BOX, *L_ABOUT_ROWS.values(), *L_PILLS.values(), *L_CARDS.values(),
                 *L_BUTTONS.values(), L_CONSOLE, *L_TOOL_BUTTONS.values(), L_PING_TABLE, L_PING_HOST_FIELD,
-                L_SEGMENTS["tool"], L_GAME_AUTO, *L_CLEAN_ROWS.values(), L_GAME_FIND, L_GAME_ADD, L_DNS_BAR,
+                L_SEGMENTS["tool"], L_GAME_AUTO, *L_CLEAN_ROWS.values(), L_CLEAN_BAR, L_GAME_FIND, L_GAME_ADD, L_DNS_BAR,
                 *L_CHECK_ROWS.values(),
                 *L_MONITOR.values(),
-                *L_SETTING_ROWS.values(), L_FOLDER_ROW, *L_LOOK_ROWS.values(), L_LOOK_RESET]
+                *L_SETTING_ROWS.values(), L_FOLDER_ROW, *L_LOOK_ROWS.values(), L_LOOK_RESET,
+                *L_PRIV_ROWS.values(), L_PRIV_FOOT]
 
     def _bg_path(self) -> str:
         return os.path.join(os.path.dirname(os.path.abspath(self.state_store.path)), "background.jpg")
@@ -4795,6 +4965,28 @@ class OptimizerApp(ctk.CTk):
             self.t_buttons[key] = c.create_text(px(bx + bw / 2), px(by + bh / 2), text="Open folder",
                                                 font=self.f_ghost, fill=TEXT_HI, tags=settings)
 
+        # ---- Privacy tab ----
+        pv = ("ui", "tab-privacy")
+        c.create_text(px(CX), px(52), anchor="nw", text="Privacy", font=self.f_title, fill=TEXT_HI, tags=pv)
+        c.create_text(px(CX), px(74), anchor="nw", font=self.f_purpose, fill=TEXT_MID, tags=pv,
+                      text="Turns off ads and tracking built into Windows. Switch one off to put back exactly what "
+                           "you had.")
+        self.t_priv_desc = {}
+        for key, title, desc, _values in PRIVACY_ITEMS:
+            x, y, w, h = L_PRIV_ROWS[key]
+            ty, dy = L_SETTING_TEXT_Y
+            c.create_text(px(x + 20), px(y + ty), anchor="nw", text=title, font=self.f_title, fill=TEXT_HI, tags=pv)
+            if privacy_needs_admin(key) and not self.admin:
+                desc = "Needs administrator rights - restart the app and accept UAC."
+            self.t_priv_desc[key] = c.create_text(px(x + 20), px(y + dy), anchor="nw", font=self.f_desc,
+                                                  fill=TEXT_MID, tags=pv, text=self._fit(desc, self.f_desc, w - 120))
+        x, y, w, h = L_PRIV_FOOT
+        self.t_priv_note = c.create_text(px(x + 20), px(y + h / 2), anchor="w", font=self.f_desc, fill=TEXT_MID,
+                                         width=px(w - 20 - 150), tags=pv)
+        bx, by, bw, bh = L_PRIV_ALL
+        self.t_buttons["privall"] = c.create_text(px(bx + bw / 2), px(by + bh / 2), text="Turn all on",
+                                                  font=self.f_ghost, fill=TEXT_HI, tags=pv)
+
         # ---- About tab ----
         ab = ("ui", "tab-about")
         x, y, w, h = L_ABOUT_ROWS["app"]
@@ -4877,14 +5069,17 @@ class OptimizerApp(ctk.CTk):
 
         # Checkup
         ck = tags["checkup"]
+        sx, sy, pw, ph = L_CHECK_SCORE
+        self.t_check_score = c.create_text(px(sx + len(CHECKUP_ITEMS) * (pw + 5) + 8), px(sy + ph / 2), anchor="w",
+                                           font=self.f_desc, fill=TEXT_HI, tags=ck)
         self.t_check = {}
         bw, bh = L_CHECK_BTN
         for key, title in CHECKUP_ITEMS:
             rx, ry, rw, rh = L_CHECK_ROWS[key]
             self.t_check[key] = {
-                "title": c.create_text(px(rx + 52), px(ry + 12), anchor="nw", text=title, font=self.f_title,
+                "title": c.create_text(px(rx + 52), px(ry + 8), anchor="nw", text=title, font=self.f_title,
                                        fill=TEXT_HI, tags=ck),
-                "detail": c.create_text(px(rx + 52), px(ry + 37), anchor="nw", font=self.f_desc, fill=TEXT_MID,
+                "detail": c.create_text(px(rx + 52), px(ry + 30), anchor="nw", font=self.f_desc, fill=TEXT_MID,
                                         tags=ck),
                 "value": c.create_text(px(rx + rw - 20), px(ry + rh / 2), anchor="e", font=self.f_plan,
                                        fill=TEXT_HI, tags=ck),
@@ -4949,16 +5144,19 @@ class OptimizerApp(ctk.CTk):
         self.t_clean = {}
         for key, title, desc, _paths in clean_targets():
             rx, ry, rw, rh = L_CLEAN_ROWS[key]
-            c.create_text(px(rx + 20), px(ry + 11), anchor="nw", text=title, font=self.f_title, fill=TEXT_HI, tags=cl)
-            c.create_text(px(rx + 20), px(ry + 35), anchor="nw", text=desc, font=self.f_desc, fill=TEXT_MID, tags=cl)
+            c.create_text(px(rx + 20), px(ry + 4), anchor="nw", text=title, font=self.f_title, fill=TEXT_HI, tags=cl)
+            c.create_text(px(rx + 20), px(ry + 25), anchor="nw", text=desc, font=self.f_label, fill=TEXT_MID, tags=cl)
             self.t_clean[key] = c.create_text(px(rx + rw - 20 - 44 - 18), px(ry + rh / 2), anchor="e",
                                               font=self.f_plan, fill=TEXT_HI, tags=cl)
-        self.t_clean_total = c.create_text(px(CX), px(318), anchor="nw", font=self.f_value, fill=TEXT_HI, tags=cl)
-        c.create_text(px(CX), px(350), anchor="nw", font=self.f_desc, fill=TEXT_MID, width=px(628), tags=cl,
-                      text="Only files nobody has touched for a day are removed. Files in use are skipped, and "
-                           "deleted files don't go to the Recycle Bin.")
-        self.t_clean_last = c.create_text(px(CX), px(396), anchor="nw", font=self.f_desc, fill=TEXT_HI,
-                                          width=px(628), tags=cl)
+        bx, by, bw, bh = L_CLEAN_BAR
+        self.t_clean_total = c.create_text(px(bx + 18), px(by + 10), anchor="nw", font=self.f_value, fill=TEXT_HI,
+                                           tags=cl)
+        self.t_clean_last = c.create_text(px(bx + 18), px(by + 42), anchor="nw", font=self.f_desc, fill=TEXT_MID,
+                                          width=px(370), tags=cl)
+        c.create_text(px(bx + bw - 20 - 44 - 14), px(by + 25), anchor="e", text="Clean up every week",
+                      font=self.f_desc, fill=TEXT_HI, tags=cl)
+        c.create_text(px(bx + bw - 20 - 44 - 14), px(by + 45), anchor="e", text="While Astra is open, never mid-game",
+                      font=self.f_label, fill=TEXT_MID, tags=cl)
         # DNS
         dn = tags["dns"]
         for col, label in (("name", "DNS SERVER"), ("median", "TYPICAL"), ("answered", "ANSWERED")):
@@ -5285,6 +5483,11 @@ class OptimizerApp(ctk.CTk):
             return self.tab == "about"
         if key == "update":
             return self.tab == "about" and self.update_state != "checking"
+        if kind == "priv":
+            return self.tab == "privacy" and not self._privacy_busy and (self.admin or not privacy_needs_admin(key))
+        if key == "privall":
+            return self.tab == "privacy" and not self._privacy_busy and any(
+                not self.privacy_state.get(k) and (self.admin or not privacy_needs_admin(k)) for k in PRIVACY_KEYS)
         if key == "protect":
             return self.tab == "settings" and self.admin and self.protection is False and not self._protect_pending
         return False
@@ -5441,6 +5644,16 @@ class OptimizerApp(ctk.CTk):
                 self._render_tools(scene)
             elif self.tab == "appearance":
                 self._render_look(scene)
+            elif self.tab == "privacy":
+                tw, th = L_TOGGLE
+                for key, (x, y, w, h) in L_PRIV_ROWS.items():
+                    target = f"priv:{key}"
+                    state = "disabled" if not self._enabled(target) else (
+                        "hover" if self.hover == target else "normal")
+                    on = self.privacy_state.get(key, False)
+                    img = self._cached(("toggle", on, state), lambda: self.painter.toggle(px(tw), px(th), on, state))
+                    paste_layer(scene, img, px(x + w - 20 - tw), px(y + (h - th) / 2))
+                self._render_ghost(scene, "privall", L_PRIV_ALL)
             elif self.tab == "about":
                 if self.update_state == "available":
                     self._render_primary(scene, "update", L_ABOUT_UPDATE)
@@ -5507,6 +5720,13 @@ class OptimizerApp(ctk.CTk):
             paste_layer(scene, img, px(x), px(y))
 
         if self.tool_page == "checkup":
+            sx, sy, pw, ph = L_CHECK_SCORE
+            for i, (key, _title) in enumerate(CHECKUP_ITEMS):
+                status = (self.checkup.get(key) or {}).get("status", "pending")
+                color = {"ok": STARLIGHT, "warn": WARN_YELLOW}.get(status, "#3A3A3A")
+                img = self._cached(("pip", color, pw, ph), lambda: self.painter.shape(
+                    px(pw), px(ph), px(ph / 2), fill=rgba(color)))
+                paste_layer(scene, img, px(sx + i * (pw + 5)), px(sy))
             bw, bh = L_CHECK_BTN
             mark = 22
             for key, (rx, ry, rw, rh) in L_CHECK_ROWS.items():
@@ -5572,6 +5792,8 @@ class OptimizerApp(ctk.CTk):
             skip = set(self._setting("clean_skip") or [])
             for key, (rx, ry, rw, rh) in L_CLEAN_ROWS.items():
                 toggle(f"clean:{key}", key not in skip, rx + rw - 20 - tw, ry + (rh - th) / 2)
+            bx, by, bw, bh = L_CLEAN_BAR
+            toggle("clean:auto", bool(self._setting("clean_weekly")), bx + bw - 20 - tw, by + (bh - th) / 2)
 
     def _render_look(self, scene: Image.Image) -> None:
         self._render_ghost(scene, "reset", L_LOOK_RESET)
@@ -5770,6 +5992,15 @@ class OptimizerApp(ctk.CTk):
                 for key, rect in L_CLEAN_ROWS.items():
                     if inside(rect):
                         return f"clean:{key}"
+                bx, by, bw, bh = L_CLEAN_BAR
+                if inside((bx + bw - 250, by, 250, bh)):
+                    return "clean:auto"
+        elif self.tab == "privacy":
+            if inside(L_PRIV_ALL):
+                return "btn:privall"
+            for key, rect in L_PRIV_ROWS.items():
+                if inside(rect):
+                    return f"priv:{key}"
         elif self.tab == "about":
             if inside(L_ABOUT_UPDATE):
                 return "btn:update"
@@ -5980,6 +6211,11 @@ class OptimizerApp(ctk.CTk):
             self._game_action(what, int(index) if index else -1)
         elif kind == "chk":
             self._checkup_action(key)
+        elif kind == "priv":
+            self._toggle_privacy([key], not self.privacy_state.get(key, False))
+        elif target == "btn:privall":
+            self._toggle_privacy([k for k in PRIVACY_KEYS if not self.privacy_state.get(k)
+                                  and (self.admin or not privacy_needs_admin(k))], True)
         elif target == "btn:checkup":
             self._run_checkup()
         elif kind == "startup":
@@ -6079,6 +6315,9 @@ class OptimizerApp(ctk.CTk):
         self._kick()
         if key == "tools" and self.tool_page == "checkup":
             self._maybe_auto_checkup()
+        if key == "privacy":
+            self._refresh_privacy()
+            self._render()
 
     def _transition(self, change) -> None:
         """Crossfade the whole window - text, log and widgets included - into the result of change().
@@ -6487,6 +6726,8 @@ class OptimizerApp(ctk.CTk):
                     self._on_update_result(*event[1:])
                 elif kind == "checkup":
                     self._on_checkup(event[1])
+                elif kind == "privacy":
+                    self._on_privacy(*event[1:])
                 elif kind == "display-fixed":
                     self._on_display_fixed(event[1])
                 elif kind == "session-ping":
@@ -6591,6 +6832,7 @@ class OptimizerApp(ctk.CTk):
             self._check_protection()
         if self._setting("updates"):
             self._schedule_update_check(4000)  # after startup has settled
+        self.after(90 * 1000, self._weekly_cleanup_tick)
 
     def _start_tray(self) -> bool:
         if self.tray is not None:
@@ -6968,8 +7210,22 @@ class OptimizerApp(ctk.CTk):
 
     # ---------------- gaming checkup ----------------
 
+    def _checkup_score(self) -> str:
+        if self.checkup_state == "running" and not self.checkup:
+            return "Checking your PC…"
+        if not self.checkup:
+            return "Not checked yet"
+        total = len(CHECKUP_ITEMS)
+        good = sum(1 for key, _t in CHECKUP_ITEMS if (self.checkup.get(key) or {}).get("status") == "ok")
+        warn = sum(1 for key, _t in CHECKUP_ITEMS if (self.checkup.get(key) or {}).get("status") == "warn")
+        text = f"All {total} look good" if good == total else f"{good} of {total} look good"
+        if warn:
+            text += f"  ·  {warn} worth fixing"
+        return text
+
     def _paint_checkup(self) -> None:
         c = self.canvas
+        c.itemconfigure(self.t_check_score, text=self._checkup_score())
         bw = L_CHECK_BTN[0]
         for key, _title in CHECKUP_ITEMS:
             items, (rx, _ry, rw, _rh) = self.t_check[key], L_CHECK_ROWS[key]
@@ -7066,6 +7322,68 @@ class OptimizerApp(ctk.CTk):
         self.checkup_state = "idle"
         self.checkup["display"] = check_display()
         self._paint_checkup()
+        self.canvas.configure(cursor="hand2" if self._enabled(self.hover) else "")
+        self._render()
+
+    # ---------------- privacy ----------------
+
+    def _refresh_privacy(self) -> None:
+        try:
+            self.privacy_state = {key: privacy_is_on(key) for key in PRIVACY_KEYS}
+        except Exception:
+            self.privacy_state = {}
+        self._paint_privacy()
+
+    def _paint_privacy(self) -> None:
+        on = sum(1 for k in PRIVACY_KEYS if self.privacy_state.get(k))
+        if on == len(PRIVACY_KEYS):
+            note = "All turned off. Each switch puts back your original setting."
+        elif on:
+            note = f"{on} of {len(PRIVACY_KEYS)} turned off. Nothing here changes performance."
+        else:
+            note = "Nothing changed yet. These are about privacy and clutter, not performance."
+        self.canvas.itemconfigure(self.t_priv_note, text=note)
+
+    def _toggle_privacy(self, keys: list, on: bool) -> None:
+        if not keys or self._privacy_busy:
+            return
+        self._privacy_busy = True
+        saved_all = dict(self.state_store.get("privacy_saved") or {})
+        self._privacy_defaults = [] if on else [k for k in keys if not saved_all.get(k)]
+
+        def work() -> None:
+            done, errors, saved = [], [], dict(saved_all)
+            for key in keys:
+                try:
+                    if on:
+                        saved[key] = privacy_apply(key, saved.get(key))
+                    else:
+                        privacy_restore(key, saved.get(key))
+                        saved.pop(key, None)
+                    done.append(key)
+                except OSError as exc:
+                    errors.append((key, exc.strerror or str(exc)))
+            SystemTweaks.broadcast_setting_change("Policy")
+            SystemTweaks.broadcast_setting_change("TraySettings")
+            self.events.put(("privacy", on, done, errors, saved))
+
+        threading.Thread(target=work, name="privacy", daemon=True).start()
+        self._render()
+
+    def _on_privacy(self, on: bool, done: list, errors: list, saved: dict) -> None:
+        self._privacy_busy = False
+        self.state_store.set("privacy_saved", saved)
+        titles = {key: title for key, title, _d, _v in PRIVACY_ITEMS}
+        if len(done) == 1 and not on and done[0] in self._privacy_defaults:
+            # It was already private before Astra touched it, so there is no "before" to go back to.
+            self._emit("ok", f"{titles[done[0]]}: off, back to the Windows default")
+        elif len(done) == 1:
+            self._emit("ok", f"{titles[done[0]]}: {'on' if on else 'off, original setting restored'}")
+        elif done:
+            self._emit("ok", f"{len(done)} privacy settings {'turned on' if on else 'restored'}")
+        for key, message in errors:
+            self._emit("fail", f"{titles[key]}: couldn't change it - {message}")
+        self._refresh_privacy()
         self.canvas.configure(cursor="hand2" if self._enabled(self.hover) else "")
         self._render()
 
@@ -7175,15 +7493,16 @@ class OptimizerApp(ctk.CTk):
                         "No games yet. Press Add game… and pick the game's .exe file.\n"
                         "It gets high CPU priority every time it runs.")
 
-    def _on_game_start(self, pid: int, exe: str, wanted: bool, error: str | None) -> None:
+    def _on_game_start(self, pid: int, exe: str, wanted: bool, error: str | None, unthrottled: bool = False) -> None:
         name = self._game_name(exe)
         self._start_session(exe)
         if wanted and error is None:
-            self._emit("ok", f"{name} started - CPU priority set to High")
+            self._emit("ok", f"{name} started - CPU priority set to High"
+                             + (", power throttling off" if unthrottled else ""))
         elif wanted:
             self._emit("warn", f"{name} started, but its priority could not be raised: {error}")
         else:
-            self._emit("info", f"{name} started")
+            self._emit("info", f"{name} started" + (" - power throttling off" if unthrottled else ""))
         self._paint_games()
         if self._setting("game_auto") and self.admin and not self.busy and not self.undo_count \
                 and self._game_auto is None:
@@ -7592,6 +7911,15 @@ class OptimizerApp(ctk.CTk):
         threading.Thread(target=work, name="clean-scan", daemon=True).start()
 
     def _toggle_clean_target(self, key: str) -> None:
+        if key == "auto":
+            on = not self._setting("clean_weekly")
+            self._set_setting("clean_weekly", on)
+            if on and not self._setting("clean_at"):
+                self._set_setting("clean_at", time.time())  # the first weekly run is a week from now
+            self._emit("ok", "Cleanup will run once a week while Astra Optimizer is open" if on
+                       else "Weekly cleanup is off")
+            self._render()
+            return
         skip = set(self._setting("clean_skip") or [])
         skip.symmetric_difference_update({key})
         self._set_setting("clean_skip", sorted(skip))
@@ -7608,12 +7936,16 @@ class OptimizerApp(ctk.CTk):
             "go to the Recycle Bin. Files that are in use are skipped.",
             "Delete files", self._run_cleanup)
 
-    def _run_cleanup(self) -> None:
+    def _run_cleanup(self, auto: bool = False) -> None:
+        if self.clean_state != "idle":
+            return
         skip = set(self._setting("clean_skip") or [])
         paths = [p for key, _t, _d, ps in clean_targets() if key not in skip for p in ps]
         self.clean_state = "cleaning"
+        self._clean_auto = auto
+        self._set_setting("clean_at", time.time())
         self.canvas.itemconfigure(self.t_buttons["clean"], text="CLEANING…")
-        self._emit("head", "Temp file cleanup started")
+        self._emit("head", "Weekly cleanup started" if auto else "Temp file cleanup started")
         self._render()
         self._kick()
 
@@ -7635,11 +7967,26 @@ class OptimizerApp(ctk.CTk):
         else:
             freed, deleted, skipped = payload
             self.clean_last = payload
-            self._emit("ok", f"Cleanup freed {human_size(freed)}: {deleted:,} files deleted, {skipped:,} in use skipped")
+            self._emit("ok", f"{'Weekly cleanup' if self._clean_auto else 'Cleanup'} freed {human_size(freed)}: "
+                             f"{deleted:,} files deleted, {skipped:,} in use skipped")
+            if self._clean_auto and freed >= 50 * 1024 ** 2 and not self._window_visible():
+                self._notify("Weekly cleanup", f"Freed {human_size(freed)} of temporary files.")
+            self._clean_auto = False
             self.after(50, self._scan_cleanup)
         self._paint_cleanup()
         self.canvas.configure(cursor="hand2" if self._enabled(self.hover) else "")
         self._render()
+
+    def _weekly_cleanup_tick(self) -> None:
+        """Hourly: run the weekly cleanup when it's due, Astra is idle and no game is running."""
+        if self._closing:
+            return
+        self.after(3600 * 1000, self._weekly_cleanup_tick)
+        if not (self._setting("clean_weekly") and self.admin) or self.busy or self.clean_state != "idle":
+            return
+        if self._running_games() or time.time() - float(self._setting("clean_at") or 0) < CLEAN_WEEK:
+            return
+        self._run_cleanup(auto=True)
 
     def _paint_cleanup(self) -> None:
         c = self.canvas
@@ -7664,11 +8011,13 @@ class OptimizerApp(ctk.CTk):
             total = "Nothing to clean right now"
         c.itemconfigure(self.t_clean_total, text=total)
         if self.clean_last:
-            freed, deleted, skipped = self.clean_last
-            c.itemconfigure(self.t_clean_last, text=f"Last cleanup freed {human_size(freed)} "
-                                                    f"({deleted:,} files deleted, {skipped:,} in use were skipped).")
+            freed, deleted, _skipped = self.clean_last
+            last = f"Last cleanup freed {human_size(freed)} ({deleted:,} files)."
+        elif self._setting("clean_at"):
+            last = f"Last cleaned {format_day(float(self._setting('clean_at')))}. Only files untouched for a day go."
         else:
-            c.itemconfigure(self.t_clean_last, text="")
+            last = "Only files nobody has touched for a day are deleted."
+        c.itemconfigure(self.t_clean_last, text=self._fit(last, self.f_desc, 370))
 
     # ---------------- ping tester ----------------
 
