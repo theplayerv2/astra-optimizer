@@ -38,7 +38,7 @@ Before anything runs you see a preview of what will change on *your* PC, and aft
 
 - Starfield, plain black or your own picture as the background, with blur, dim, panel opacity and frost.
 - Motion: follow Windows, Full, Reduced or Off.
-- Keep running in the tray, start with Windows (elevated, no UAC prompt), a global hotkey (**Ctrl+Alt+O**) to toggle your mode in-game, and an optional System Restore point before your first optimize each day.
+- Keep running in the tray, start with Windows (elevated, no UAC prompt), a global hotkey (**Ctrl+Alt+O**) to toggle your mode in-game, an optional System Restore point before your first optimize each day, and a check for new versions.
 
 | | |
 |---|---|
@@ -56,6 +56,10 @@ Before anything runs you see a preview of what will change on *your* PC, and aft
 
 Get **Astra Optimizer.exe** from the [Releases](../../releases) page and run it. It needs administrator
 rights, so Windows asks once (UAC). Without them it still opens, but only to monitor.
+
+When a newer version comes out, the About tab shows a **Download** button that opens its release page.
+Astra Optimizer only checks; it never downloads or installs anything by itself, and you can turn the
+check off in Settings.
 
 The exe isn't code-signed, so the first launch may show *Windows protected your PC*. Choose **More info**
 and then **Run anyway**, or build it yourself from source.

@@ -56,10 +56,14 @@ except Exception:  # pragma: no cover - depends on the build
 
 APP_NAME = "Astra Optimizer"
 LEGACY_APP_NAME = "Optimizer"  # pre-1.12 name: data folder and startup task are carried over
-APP_VERSION = "1.0.0"
-DISPLAY_VERSION = "v1"
+APP_VERSION = "1.0.1"
+DISPLAY_VERSION = "v1.0.1"
 CREDIT_NAME = "theplayerv2"
 CREDIT_URL = "https://guns.lol/playerv2"
+UPDATE_REPO = "theplayerv2/astra-optimizer"
+RELEASES_URL = f"https://github.com/{UPDATE_REPO}/releases"
+UPDATE_API = f"https://api.github.com/repos/{UPDATE_REPO}/releases/latest"
+UPDATE_INTERVAL_MS = 12 * 3600 * 1000  # re-check while it stays open in the tray
 
 # Monochrome palette - brightness carries all meaning (no hue accents)
 VOID = "#000000"          # true black space
@@ -1927,7 +1931,55 @@ EVENT_MODIFY_STATE = 0x0002
 SW_RESTORE = 9
 DEFAULT_SETTINGS = {"tray": True, "autostart": False, "hotkey": True, "custom_host": "", "tray_hint": False,
                     "preview": True, "games": [], "game_auto": False, "clean_skip": [], "dns_original": None,
-                    "restore_point": True, "restore_point_at": 0}
+                    "restore_point": True, "restore_point_at": 0, "updates": True}
+
+
+# --------------------------------------------------------------------------------------
+# Update check (GitHub releases; it only looks, nothing is downloaded or installed)
+# --------------------------------------------------------------------------------------
+
+def parse_version(text: str | None) -> tuple[int, ...] | None:
+    """'v1.0.2' -> (1, 0, 2); trailing zeros dropped so 'v1' == '1.0.0'."""
+    match = re.match(r"\s*v?(\d+(?:\.\d+)*)", text or "", re.IGNORECASE)
+    if not match:
+        return None
+    parts = [int(part) for part in match.group(1).split(".")]
+    while len(parts) > 1 and parts[-1] == 0:
+        parts.pop()
+    return tuple(parts)
+
+
+def is_newer_version(tag: str | None, current: str = APP_VERSION) -> bool:
+    latest, mine = parse_version(tag), parse_version(current)
+    return latest is not None and mine is not None and latest > mine
+
+
+def fetch_latest_release(timeout: float = 8.0) -> dict | None:
+    """The newest published (non-draft, non-pre) release as {"tag", "url"}, or None if there
+    is none yet. Raises OSError/ValueError when GitHub can't be reached or answers oddly."""
+    import urllib.error
+    import urllib.request
+    request = urllib.request.Request(UPDATE_API, headers={
+        "Accept": "application/vnd.github+json", "User-Agent": f"Astra-Optimizer/{APP_VERSION}"})
+    try:
+        with urllib.request.urlopen(request, timeout=timeout) as response:
+            data = json.loads(response.read(512 * 1024).decode("utf-8"))
+    except urllib.error.HTTPError as exc:
+        if exc.code == 404:  # the repository has no releases yet
+            return None
+        raise OSError(f"GitHub answered {exc.code}") from exc
+    tag = str(data.get("tag_name") or "")
+    if parse_version(tag) is None:
+        raise ValueError("the latest release has no version number")
+    url = str(data.get("html_url") or "")
+    if not url.startswith(RELEASES_URL + "/"):  # only ever open this project's own release pages
+        url = RELEASES_URL
+    return {"tag": tag, "url": url}
+
+
+def display_tag(tag: str) -> str:
+    tag = tag.strip()
+    return tag if tag[:1] in "vV" else f"v{tag}"
 
 
 class HotkeyThread(threading.Thread):
@@ -2790,6 +2842,7 @@ L_ABOUT_ICON = (100, 74, 92)          # x, y, size
 L_ABOUT_AVATAR = (100, 220, 84)
 L_ABOUT_PROFILE = (546, 242, 140, 40)
 L_ABOUT_LINK = (204, 286, 150, 20)    # the link text itself is clickable too
+L_ABOUT_UPDATE = (546, 74, 140, 40)   # "Check for updates" / "Download v…"
 L_RAIL_BOX = (6, 44, 60, 422)                  # floating glass box holding the tabs
 L_TABS = {key: (9, 52 + i * 66, 54, 58) for i, key in enumerate(TAB_ORDER)}
 # Boost tab
@@ -2829,12 +2882,13 @@ L_PING_ROW_Y0, L_PING_ROW_H = 134, 34
 L_PING_HOST_FIELD = (78, 424, 500, 42)
 L_PING_COLS = {"name": 94, "latency": 322, "jitter": 410, "loss": 478, "bars": 536}
 # Settings tab
-L_SETTING_ROWS = {key: (78, 100 + i * 62, 628, 56)
-                  for i, key in enumerate(("tray", "autostart", "hotkey", "preview", "restore"))}
+L_SETTING_ROWS = {key: (78, 96 + i * 53, 628, 48)
+                  for i, key in enumerate(("tray", "autostart", "hotkey", "preview", "restore", "updates"))}
+L_SETTING_TEXT_Y = (6, 26)  # title and description offsets inside a row
 L_TOGGLE = (44, 24)
-L_FOLDER_ROW = (78, 412, 628, 48)
-L_SETTING_BUTTONS = {"folder": (570, 416, 120, 40)}
-L_PROTECT_BUTTON = (78 + 628 - 20 - 44 - 16 - 104, 100 + 4 * 62 + 13, 104, 30)  # "Turn on…" in the restore row
+L_FOLDER_ROW = (78, 416, 628, 46)
+L_SETTING_BUTTONS = {"folder": (78 + 628 - 16 - 120, 416 + 4, 120, 38)}
+L_PROTECT_BUTTON = (78 + 628 - 20 - 44 - 16 - 104, L_SETTING_ROWS["restore"][1] + 9, 104, 30)  # "Turn on…"
 L_DIALOG_W = 404
 # Appearance tab
 L_LOOK_RESET = (586, 50, 120, 36)
@@ -2874,6 +2928,7 @@ SETTING_TEXT = {
     "hotkey": (f"Global hotkey  \u00b7  {HOTKEY_LABEL}", "Applies the selected mode, or undoes it. Works in-game."),
     "preview": ("Preview and summary", "Lists what a mode will change, then what it did. Hotkey and tray skip it."),
     "restore": ("Restore point first", "Saves a Windows restore point before your first optimize each day."),
+    "updates": ("Check for updates", "Asks GitHub for a newer version at startup. Nothing downloads on its own."),
 }
 
 CARD_SPECS = [
@@ -3621,6 +3676,9 @@ class OptimizerApp(ctk.CTk):
         self.painter.glass = self.look["glass"] / 100
         self._bg_cache: dict = {}
         self._bg_version = 0
+        self.update_state = "idle"  # idle | checking | current | available | failed
+        self.update_info: dict | None = None
+        self._update_job = None
         self._backdrop_job = None
         self._slider_drag: str | None = None
         self._fade: dict | None = None
@@ -4233,9 +4291,10 @@ class OptimizerApp(ctk.CTk):
         self.t_setting_desc = {}
         for key, (x, y, w, h) in L_SETTING_ROWS.items():
             title, desc = SETTING_TEXT[key]
-            c.create_text(px(x + 20), px(y + 8), anchor="nw", text=title, font=self.f_title, fill=TEXT_HI,
+            ty, dy = L_SETTING_TEXT_Y
+            c.create_text(px(x + 20), px(y + ty), anchor="nw", text=title, font=self.f_title, fill=TEXT_HI,
                           tags=settings)
-            self.t_setting_desc[key] = c.create_text(px(x + 20), px(y + 30), anchor="nw", font=self.f_desc,
+            self.t_setting_desc[key] = c.create_text(px(x + 20), px(y + dy), anchor="nw", font=self.f_desc,
                                                      fill=TEXT_MID, tags=settings)
             self._set_setting_desc(key, desc)
         if not self.admin:
@@ -4247,9 +4306,9 @@ class OptimizerApp(ctk.CTk):
         self.t_buttons["protect"] = c.create_text(px(bx + bw / 2), px(by + bh / 2), text="Turn on…",
                                                   font=self.f_ghost_small, fill=TEXT_HI, tags=(*settings, "protect-btn"))
         x, y, w, h = L_FOLDER_ROW
-        c.create_text(px(x + 20), px(y + 6), anchor="nw", text="Logs and undo data", font=self.f_title,
+        c.create_text(px(x + 20), px(y + 5), anchor="nw", text="Logs and undo data", font=self.f_title,
                       fill=TEXT_HI, tags=settings)
-        c.create_text(px(x + 20), px(y + 27), anchor="nw", text=STATE_DIR,
+        c.create_text(px(x + 20), px(y + 25), anchor="nw", text=STATE_DIR,
                       font=self.f_mono, fill=TEXT_MID, tags=settings)
         for key, (bx, by, bw, bh) in L_SETTING_BUTTONS.items():
             self.t_buttons[key] = c.create_text(px(bx + bw / 2), px(by + bh / 2), text="Open folder",
@@ -4260,8 +4319,11 @@ class OptimizerApp(ctk.CTk):
         x, y, w, h = L_ABOUT_ROWS["app"]
         tx = L_ABOUT_ICON[0] + L_ABOUT_ICON[2] + 22
         c.create_text(px(tx), px(y + 24), anchor="nw", text=APP_NAME, font=self.f_hero, fill=TEXT_HI, tags=ab)
-        c.create_text(px(tx), px(y + 62), anchor="nw", font=self.f_desc, fill=TEXT_MID, tags=ab,
-                      text=f"Version {DISPLAY_VERSION[1:]}  \u00b7  for Windows 10 and 11")
+        self.t_about_version = c.create_text(px(tx), px(y + 62), anchor="nw", font=self.f_desc, fill=TEXT_MID,
+                                             tags=ab, text=self._version_line())
+        bx, by, bw, bh = L_ABOUT_UPDATE
+        self.t_buttons["update"] = c.create_text(px(bx + bw / 2), px(by + bh / 2), text=self._update_label(),
+                                                 font=self.f_ghost, fill=TEXT_HI, tags=ab)
         c.create_text(px(tx), px(y + 86), anchor="nw", font=self.f_desc, fill=TEXT_HI, width=px(x + w - 24 - tx),
                       tags=ab, text="Tunes Windows for gaming in one click, and puts it all back just as easily.")
         x, y, w, h = L_ABOUT_ROWS["credits"]
@@ -4715,6 +4777,8 @@ class OptimizerApp(ctk.CTk):
             return self.tab == "settings"
         if key == "profile":
             return self.tab == "about"
+        if key == "update":
+            return self.tab == "about" and self.update_state != "checking"
         if key == "protect":
             return self.tab == "settings" and self.admin and self.protection is False and not self._protect_pending
         return False
@@ -4861,6 +4925,9 @@ class OptimizerApp(ctk.CTk):
                 paste_layer(scene, img, px(x) - m, px(y) - m)
                 if not selected:
                     self.canvas.itemconfigure(self.t_tabs[key], fill="#CFCFCF" if hovered else TEXT_MID)
+                if key == "about" and self.update_state == "available":  # a new version is out
+                    r, cx, cy = px(3.5), px(x + w - 13), px(y + 11)
+                    ImageDraw.Draw(scene).ellipse((cx - r, cy - r, cx + r, cy + r), fill=STARLIGHT)
             if self.tab == "boost":
                 self._render_boost(scene)
             elif self.tab == "tools":
@@ -4868,6 +4935,10 @@ class OptimizerApp(ctk.CTk):
             elif self.tab == "appearance":
                 self._render_look(scene)
             elif self.tab == "about":
+                if self.update_state == "available":
+                    self._render_primary(scene, "update", L_ABOUT_UPDATE)
+                else:
+                    self._render_ghost(scene, "update", L_ABOUT_UPDATE)
                 self._render_ghost(scene, "profile", L_ABOUT_PROFILE)
                 self.canvas.itemconfigure(self.t_about_link,
                                           fill=TEXT_HI if self.hover == "btn:profile" else SILVER)
@@ -5163,6 +5234,8 @@ class OptimizerApp(ctk.CTk):
                     if inside(rect):
                         return f"clean:{key}"
         elif self.tab == "about":
+            if inside(L_ABOUT_UPDATE):
+                return "btn:update"
             if inside(L_ABOUT_PROFILE) or inside(L_ABOUT_LINK):
                 return "btn:profile"
         elif self.tab == "appearance":
@@ -5358,6 +5431,11 @@ class OptimizerApp(ctk.CTk):
             self._open_state_folder()
         elif target == "btn:profile":
             self._open_link(CREDIT_URL)
+        elif target == "btn:update":
+            if self.update_state == "available" and self.update_info:
+                self._open_link(self.update_info["url"])
+            else:
+                self._check_updates(manual=True)
         elif target == "btn:protect":
             self._confirm_protection()
         elif kind == "game":
@@ -5860,6 +5938,8 @@ class OptimizerApp(ctk.CTk):
                 elif kind == "autostart-state":
                     self._set_setting("autostart", bool(event[1]))
                     self._render()
+                elif kind == "update":
+                    self._on_update_result(*event[1:])
                 elif kind == "game-start":
                     self._on_game_start(*event[1:])
                 elif kind == "game-stop":
@@ -5957,6 +6037,8 @@ class OptimizerApp(ctk.CTk):
         if self.admin:
             threading.Thread(target=self._sync_autostart, name="autostart", daemon=True).start()
             self._check_protection()
+        if self._setting("updates"):
+            self._schedule_update_check(4000)  # after startup has settled
 
     def _start_tray(self) -> bool:
         if self.tray is not None:
@@ -6113,6 +6195,12 @@ class OptimizerApp(ctk.CTk):
             on = not self._setting("preview")
             self._set_setting("preview", on)
             self._emit("ok", "Modes now show a preview and a summary" if on else "Modes now run without a preview")
+        elif key == "updates":
+            on = not self._setting("updates")
+            self._set_setting("updates", on)
+            self._emit("ok", "Astra Optimizer will check GitHub for new versions" if on
+                       else "Automatic update checks are off. About → Check for updates still works")
+            self._schedule_update_check(5000 if on else None)
         elif key == "autostart":
             desired = not self._setting("autostart")
             self._autostart_pending, self._autostart_desired = True, desired
@@ -6145,6 +6233,77 @@ class OptimizerApp(ctk.CTk):
         if exists and (getattr(sys, "frozen", False) or legacy):
             AutoStart.enable()
         self.events.put(("autostart-state", exists))
+
+    # ---------------- update check ----------------
+
+    def _version_line(self) -> str:
+        base = f"Version {DISPLAY_VERSION[1:]}  ·  for Windows 10 and 11"
+        status = {"checking": "Checking for updates…", "current": "Up to date",
+                  "failed": "Couldn't reach GitHub"}.get(self.update_state)
+        if self.update_state == "available" and self.update_info:
+            status = f"{display_tag(self.update_info['tag'])} is available"
+        return f"{base}  ·  {status}" if status else base
+
+    def _update_label(self) -> str:
+        if self.update_state == "available" and self.update_info:
+            return f"Download {display_tag(self.update_info['tag'])}"
+        return "Checking…" if self.update_state == "checking" else "Check for updates"
+
+    def _refresh_update_ui(self) -> None:
+        self.canvas.itemconfigure(self.t_about_version, text=self._version_line(),
+                                  fill=TEXT_HI if self.update_state == "available" else TEXT_MID)
+        self.canvas.itemconfigure(self.t_buttons["update"], text=self._update_label())
+        self.canvas.configure(cursor="hand2" if self._enabled(self.hover) else "")
+        self._render()
+
+    def _schedule_update_check(self, delay_ms: int | None) -> None:
+        """(Re)arm the automatic check; None cancels it."""
+        if self._update_job is not None:
+            self.after_cancel(self._update_job)
+            self._update_job = None
+        if delay_ms is not None:
+            self._update_job = self.after(delay_ms, self._auto_update_check)
+
+    def _auto_update_check(self) -> None:
+        self._update_job = None
+        if not self._setting("updates"):
+            return
+        self._check_updates(manual=False)
+        self._schedule_update_check(UPDATE_INTERVAL_MS)
+
+    def _check_updates(self, manual: bool) -> None:
+        if self.update_state == "checking":
+            return
+        previous = self.update_state
+        self.update_state = "checking"
+        self._refresh_update_ui()
+
+        def work():
+            try:
+                self.events.put(("update", manual, previous, fetch_latest_release(), None))
+            except Exception as exc:  # offline, blocked, GitHub down: never bother the user unasked
+                self.events.put(("update", manual, previous, None, str(exc) or type(exc).__name__))
+
+        threading.Thread(target=work, name="update-check", daemon=True).start()
+
+    def _on_update_result(self, manual: bool, previous: str, release: dict | None, error: str | None) -> None:
+        if error is not None:
+            # A failed automatic check keeps whatever we knew before; only a manual one says so.
+            self.update_state = "failed" if manual or previous in ("idle", "failed") else previous
+            if manual:
+                self._emit("warn", f"Couldn't check for updates: {error}")
+        elif release and is_newer_version(release["tag"]):
+            announce = not (previous == "available" and self.update_info
+                            and self.update_info["tag"] == release["tag"])
+            self.update_state, self.update_info = "available", release
+            if announce or manual:
+                self._emit("info", f"{APP_NAME} {display_tag(release['tag'])} is available. "
+                                   "Download it from the About tab.")
+        else:
+            self.update_state, self.update_info = "current", None
+            if manual:
+                self._emit("ok", f"{APP_NAME} {DISPLAY_VERSION} is the latest version")
+        self._refresh_update_ui()
 
     def _open_link(self, url: str) -> None:
         """Open in the user's browser. Going through Explorer keeps the browser out of the
