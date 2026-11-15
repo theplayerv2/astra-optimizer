@@ -1559,6 +1559,8 @@ class SystemTweaks:
             lines.append(f"Pause until restart: {', '.join(running)}" if running
                          else "Background services: already paused")
             lines.append("Free RAM: trim background apps and clear the standby cache (Medal and your games are skipped)")
+            if windowed_games_pending():
+                lines.append("Optimizations for windowed games and variable refresh rate on")
             lines.append("Flush the DNS cache")
         elif profile == "cozy":
             power("High Performance", "high performance")
@@ -1568,6 +1570,8 @@ class SystemTweaks:
             visual("smooth", "changed for smooth animations")
             if cls._reg_changes(GAME_MODE_ON):
                 lines.append("Game Mode on")
+            if windowed_games_pending():
+                lines.append("Optimizations for windowed games and variable refresh rate on")
         else:
             if has_battery():
                 power("Balanced (battery detected)", "balanced")
@@ -1585,6 +1589,15 @@ class SystemTweaks:
 
     # ---------------- profiles ----------------
 
+    def apply_windowed_games(self) -> None:
+        """Optimizations for windowed games + VRR for older games (kept in the undo snapshot)."""
+        current = self.reg_read("HKCU", GPU_PREF_KEY, DX_GLOBAL)
+        target = dx_globals_with(current[0] if current else "", windowed_game_flags())
+        if target is None:
+            self.log.ok("Optimizations for windowed games: already on")
+            return
+        self.reg_set("HKCU", GPU_PREF_KEY, DX_GLOBAL, target, "Optimizations for windowed games", kind=winreg.REG_SZ)
+
     def profile_max_fps(self) -> None:
         self.log.head("Power")
         self.activate_ultimate()
@@ -1592,6 +1605,8 @@ class SystemTweaks:
         self.log.head("Game Bar / DVR")
         self.apply_reg_table(GAME_DVR_OFF)
         self.apply_reg_table(GAME_MODE_ON)
+        self.log.head("Windowed games")
+        self.apply_windowed_games()
         self.log.head("Network")
         self.flush_dns()
         self.log.head("Background services (suspended until reboot)")
@@ -1609,6 +1624,8 @@ class SystemTweaks:
         self.apply_visual_mode("smooth")
         self.log.head("Game Mode")
         self.apply_reg_table(GAME_MODE_ON)
+        self.log.head("Windowed games")
+        self.apply_windowed_games()
 
     def profile_quality(self) -> None:
         self.log.head("Power")
@@ -2905,7 +2922,96 @@ DM_BITSPERPEL, DM_PELSWIDTH, DM_PELSHEIGHT, DM_DISPLAYFREQUENCY = 0x40000, 0x800
 CDS_UPDATEREGISTRY, CDS_TEST = 0x1, 0x2
 
 CHECKUP_ITEMS = [("display", "Refresh rate"), ("memory", "Memory speed"), ("driver", "Graphics driver"),
+                 ("gamegpu", "Graphics chip for games"), ("slot", "Graphics card slot"),
+                 ("features", "Gaming features"), ("security", "Memory Integrity"), ("storage", "Storage"),
                  ("network", "Connection"), ("power", "Power")]
+_FAKE_GPU = re.compile(r"microsoft basic|remote display|virtual|parsec|citrix|mirage|displaylink|idd", re.IGNORECASE)
+
+# DirectX per-app GPU choice and the global "windowed games" / VRR switches (Settings > Display > Graphics)
+GPU_PREF_KEY = r"Software\Microsoft\DirectX\UserGpuPreferences"
+DX_GLOBAL = "DirectXUserGlobalSettings"
+REG_GAMEBAR = r"Software\Microsoft\GameBar"
+REG_HVCI = r"SYSTEM\CurrentControlSet\Control\DeviceGuard\Scenarios\HypervisorEnforcedCodeIntegrity"
+STORAGE_LOW_PCT, STORAGE_LOW_GB = 10, 15
+
+
+def windows_build() -> int:
+    try:
+        return sys.getwindowsversion().build
+    except Exception:
+        return 0
+
+
+def windowed_game_flags() -> dict[str, str]:
+    """Variable refresh rate for DX11 games (Windows 10 1903+) and, on Windows 11, the flip-model
+    upgrade for DX10/11 games in a window or borderless ("Optimizations for windowed games")."""
+    flags = {"VRROptimizeEnable": "1"}
+    if windows_build() >= 22000:
+        flags["SwapEffectUpgradeEnable"] = "1"
+    return flags
+
+
+def parse_dx_globals(text: str | None) -> dict[str, str]:
+    out: dict[str, str] = {}
+    for part in (text or "").split(";"):
+        if "=" in part:
+            key, _, value = part.partition("=")
+            out[key.strip()] = value.strip()
+    return out
+
+
+def dx_globals_with(text: str | None, flags: dict[str, str]) -> str | None:
+    """The settings string with flags switched on, keeping every other entry (Auto HDR and so on);
+    None when they're all on already."""
+    current = parse_dx_globals(text)
+    if all(current.get(k) == v for k, v in flags.items()):
+        return None
+    current.update(flags)
+    return "".join(f"{k}={v};" for k, v in current.items())
+
+
+def windowed_games_pending() -> bool:
+    current = _reg_get("HKCU", GPU_PREF_KEY, DX_GLOBAL)
+    return dx_globals_with(current[0] if current else "", windowed_game_flags()) is not None
+
+
+def gpu_preference(path: str) -> int | None:
+    """Windows' per-app graphics choice: 0 let Windows decide, 1 power saving, 2 high performance."""
+    current = _reg_get("HKCU", GPU_PREF_KEY, path)
+    match = re.search(r"GpuPreference=(\d+)", str(current[0])) if current else None
+    return int(match.group(1)) if match else None
+
+
+def set_gpu_preference(path: str, preference: int | None) -> None:
+    if preference is None:
+        _reg_delete("HKCU", GPU_PREF_KEY, path)
+    else:
+        _reg_put("HKCU", GPU_PREF_KEY, path, f"GpuPreference={preference};", winreg.REG_SZ)
+
+
+def real_gpus(gpus: list[dict]) -> list[dict]:
+    return [g for g in gpus if g.get("name") and not _FAKE_GPU.search(g["name"])]
+
+
+def fast_gpu(gpus: list[dict]) -> dict | None:
+    """The discrete card: NVIDIA first, then an AMD Radeon RX, else the last real adapter."""
+    real = real_gpus(gpus)
+    for test in (lambda g: _gpu_vendor(g) == "10DE", lambda g: _gpu_vendor(g) == "1002" and " RX" in g["name"]):
+        found = next((g for g in real if test(g)), None)
+        if found:
+            return found
+    return real[-1] if real else None
+
+
+def gpu_label(gpu: dict | None) -> str:
+    name = short_gpu_name((gpu or {}).get("name", "")) or "graphics card"
+    return re.sub(r"\s+(Laptop GPU|Laptop|GPU)$", "", name, flags=re.IGNORECASE)
+
+
+def gpu_setup(gpus: list[dict], laptop: bool) -> dict:
+    """{"hybrid": a laptop with two graphics chips, "fast": the strong one's short name}."""
+    return {"hybrid": laptop and len(real_gpus(gpus)) >= 2, "fast": gpu_label(fast_gpu(gpus))}
+
 DRIVER_PAGES = {"10DE": ("NVIDIA", "https://www.nvidia.com/en-us/drivers/"),
                 "1002": ("AMD", "https://www.amd.com/en/support/download/drivers.html"),
                 "8086": ("Intel", "https://www.intel.com/content/www/us/en/support/detect.html")}
@@ -3050,8 +3156,7 @@ def _nvidia_version(version: str) -> str:
 
 def check_driver(gpus: list[dict], today: _dt.date | None = None) -> dict:
     today = today or _dt.date.today()
-    fake = re.compile(r"microsoft basic|remote display|virtual|parsec|citrix|mirage|displaylink|idd", re.IGNORECASE)
-    real = [g for g in gpus if g.get("name") and not fake.search(g["name"])]
+    real = real_gpus(gpus)
     if not real:
         basic = next((g for g in gpus if "basic" in str(g.get("name", "")).lower()), None)
         if basic:
@@ -3084,6 +3189,140 @@ def check_driver(gpus: list[dict], today: _dt.date | None = None) -> dict:
         return result
     return {"status": "ok", "value": version or date.strftime("%b %Y"),
             "detail": f"{name} driver from {when}, recent enough."}
+
+
+def check_game_gpu(gpus: list[dict], laptop: bool, games: list[dict], preference=None) -> dict:
+    preference = preference or gpu_preference
+    setup = gpu_setup(gpus, laptop)
+    fast = setup["fast"]
+    if not real_gpus(gpus):
+        return {"status": "info", "detail": "No graphics card found.", "value": ""}
+    if not setup["hybrid"]:
+        return {"status": "ok", "value": fast,
+                "detail": f"Games run on the {fast}. This only needs fixing on laptops with two graphics chips."}
+    if not games:
+        return {"status": "info", "value": "",
+                "detail": f"Add your games on the Games page and Astra will make them use the {fast}."}
+    loose = [g for g in games if preference(g["path"]) != 2]
+    if loose:
+        return {"status": "warn", "value": "", "fast": fast, "action": ("gamegpu", "Use fast GPU"),
+                "games": [g["path"] for g in loose],
+                "detail": f"{plural(len(loose), 'game')} of yours {'isn' if len(loose) == 1 else 'aren'}'t set to use "
+                          f"the {fast}. Laptops sometimes run games on the built-in graphics."}
+    return {"status": "ok", "value": fast, "detail": f"All {plural(len(games), 'game')} use the {fast}."}
+
+
+def check_gpu_slot(gpus: list[dict], laptop: bool) -> dict:
+    gpu = fast_gpu(gpus)
+    if gpu is None:
+        return {"status": "info", "detail": "No graphics card found.", "value": ""}
+    width, top = int(gpu.get("width") or 0), int(gpu.get("max_width") or 0)
+    name = gpu_label(gpu)
+    if laptop and not top:
+        return {"status": "ok", "value": "", "detail": f"The {name} is built into the laptop, so there's no slot to check."}
+    if not width or not top:
+        return {"status": "info", "value": "", "detail": f"Couldn't read the slot speed of the {name}."}
+    if width < top:
+        return {"status": "warn", "value": f"x{width}",
+                "detail": f"The {name} runs at PCIe x{width} but supports x{top}. Check it sits in the top full-length "
+                          "slot, without a riser cable."}
+    return {"status": "ok", "value": f"x{width}", "detail": f"The {name} runs at its full PCIe x{top} link."}
+
+
+def gaming_features() -> dict[str, bool | None]:
+    game_mode = _reg_get("HKCU", REG_GAMEBAR, "AutoGameModeEnabled")
+    hags = _reg_get("HKLM", REG_GRAPHICS, "HwSchMode")
+    dx = parse_dx_globals((_reg_get("HKCU", GPU_PREF_KEY, DX_GLOBAL) or [""])[0])
+    return {"game_mode": game_mode is None or game_mode[0] != 0,  # missing means on
+            "windowed": dx.get("SwapEffectUpgradeEnable") == "1" if windows_build() >= 22000 else None,
+            "vrr": dx.get("VRROptimizeEnable") == "1",
+            "hags": hags is not None and hags[0] == 2}
+
+
+def check_features(state: dict | None = None) -> dict:
+    state = state or gaming_features()
+    names = {"game_mode": "Game Mode", "windowed": "optimizations for windowed games",
+             "vrr": "variable refresh rate for older games", "hags": "GPU scheduling"}
+    off = [names[k] for k in ("game_mode", "windowed", "vrr", "hags") if state.get(k) is False]
+    if not off:
+        return {"status": "ok", "value": "On",
+                "detail": "Game Mode, windowed-game optimizations, variable refresh rate and GPU scheduling are on."}
+    text = ", ".join(off)
+    return {"status": "warn", "value": "", "action": ("features", "Turn on"), "off": off,
+            "detail": f"Off: {text[:1].upper()}{text[1:]}. Turning {'it' if len(off) == 1 else 'them'} on helps "
+                      "games run smoother, especially in borderless windows."}
+
+
+def fix_features(admin: bool) -> list[str]:
+    """Switch the gaming features on; returns what couldn't be changed."""
+    failed = []
+    try:
+        _reg_put("HKCU", REG_GAMEBAR, "AutoGameModeEnabled", 1)
+        current = _reg_get("HKCU", GPU_PREF_KEY, DX_GLOBAL)
+        target = dx_globals_with(current[0] if current else "", windowed_game_flags())
+        if target:
+            _reg_put("HKCU", GPU_PREF_KEY, DX_GLOBAL, target, winreg.REG_SZ)
+    except OSError as exc:
+        failed.append(f"game settings ({exc.strerror or exc})")
+    if admin:
+        try:
+            _reg_put("HKLM", REG_GRAPHICS, "HwSchMode", 2)
+        except OSError as exc:
+            failed.append(f"GPU scheduling ({exc.strerror or exc})")
+    else:
+        failed.append("GPU scheduling (needs administrator rights)")
+    return failed
+
+
+def check_security(running: list | None = None) -> dict:
+    """Memory Integrity (HVCI). Reported, never changed: switching it off is a security trade-off."""
+    if running is not None:
+        on = 2 in [int(v) for v in running if str(v).isdigit()]
+    else:
+        value = _reg_get("HKLM", REG_HVCI, "Enabled")
+        on = value is not None and value[0] == 1
+    if on:
+        return {"status": "info", "value": "On", "action": ("link", "Open setting", "windowsdefender://coreisolation"),
+                "detail": "It blocks malicious drivers, but can cost up to 5-10% FPS in some games. Turning it off "
+                          "is your call."}
+    return {"status": "ok", "value": "Off",
+            "detail": "Off, so it costs no performance. It also isn't guarding against bad drivers."}
+
+
+def trim_enabled() -> bool | None:
+    rc, out = run_command(["fsutil", "behavior", "query", "DisableDeleteNotify"], timeout=10)
+    match = re.search(r"NTFS\s+DisableDeleteNotify\s*=\s*(\d)", out) if rc == 0 else None
+    return None if match is None else match.group(1) == "0"
+
+
+def drive_space(paths: list[str]) -> list[dict]:
+    drives = []
+    for path in [SYSTEM_DRIVE + "\\", *paths]:
+        drive = os.path.splitdrive(os.path.abspath(path))[0].upper()
+        if drive and drive not in [d["drive"] for d in drives]:
+            try:
+                usage = __import__("shutil").disk_usage(drive + "\\")
+            except OSError:
+                continue
+            drives.append({"drive": drive, "free": usage.free, "total": usage.total})
+    return drives
+
+
+def check_storage(drives: list[dict], trim: bool | None) -> dict:
+    low = [d for d in drives if d["total"] and (d["free"] * 100 / d["total"] < STORAGE_LOW_PCT
+                                                 or d["free"] < STORAGE_LOW_GB * 1024 ** 3)]
+    if trim is False:
+        return {"status": "warn", "value": "", "action": ("trim", "Turn on TRIM"),
+                "detail": "TRIM is off, so SSDs slowly lose speed. Windows has it on by default."}
+    if low:
+        d = low[0]
+        pct = d["free"] * 100 / d["total"]
+        return {"status": "warn", "value": human_size(d["free"]), "action": ("cleanup", "Clean up"),
+                "detail": f"Drive {d['drive']} has only {human_size(d['free'])} free ({pct:.0f}%). Games load and "
+                          "update slower on a nearly full drive."}
+    free = ", ".join(f"{d['drive']} {human_size(d['free'])}" for d in drives[:3])
+    trim_text = " TRIM is on." if trim else ""
+    return {"status": "ok", "value": "", "detail": f"Free space: {free}.{trim_text}"}
 
 
 def _link_speed(bps: float) -> str:
@@ -3146,20 +3385,29 @@ def checkup_system_info() -> dict:
         "$m = @(Get-CimInstance Win32_PhysicalMemory | ForEach-Object { [pscustomobject]@{ "
         "speed = [int]$_.Speed; configured = [int]$_.ConfiguredClockSpeed; type = [int]$_.SMBIOSMemoryType; "
         "part = [string]$_.PartNumber } }); "
-        "$g = @(Get-CimInstance Win32_VideoController | ForEach-Object { [pscustomobject]@{ "
+        "$g = @(Get-CimInstance Win32_VideoController | ForEach-Object { $w = 0; $mw = 0; "
+        "if ($_.PNPDeviceID -like 'PCI*') { $p = Get-PnpDeviceProperty -InstanceId $_.PNPDeviceID -KeyName "
+        "'DEVPKEY_PciDevice_CurrentLinkWidth','DEVPKEY_PciDevice_MaxLinkWidth'; "
+        "$w = [int]($p | Where-Object KeyName -eq 'DEVPKEY_PciDevice_CurrentLinkWidth').Data; "
+        "$mw = [int]($p | Where-Object KeyName -eq 'DEVPKEY_PciDevice_MaxLinkWidth').Data }; "
+        "[pscustomobject]@{ "
         "name = [string]$_.Name; version = [string]$_.DriverVersion; pnp = [string]$_.PNPDeviceID; "
+        "width = $w; max_width = $mw; "
         "date = $(if ($_.DriverDate) { $_.DriverDate.ToString('yyyy-MM-dd') } else { '' }) } }); "
+        "$dg = Get-CimInstance -Namespace root\\Microsoft\\Windows\\DeviceGuard -ClassName Win32_DeviceGuard; "
+        "$hv = if ($dg) { @($dg.SecurityServicesRunning) } else { $null }; "
         "$n = $null; "
         f"if ({index}) {{ $a = Get-NetAdapter -InterfaceIndex {index}; if ($a) {{ $n = [pscustomobject]@{{ "
         "name = [string]$a.Name; desc = [string]$a.InterfaceDescription; media = [string]$a.PhysicalMediaType; "
         "ndis = [string]$a.NdisPhysicalMedium; bps = [double]$a.ReceiveLinkSpeed } } }; "
-        "[pscustomobject]@{ memory = $m; gpus = $g; net = $n } | ConvertTo-Json -Compress -Depth 4")
+        "[pscustomobject]@{ memory = $m; gpus = $g; net = $n; hvci = $hv } | ConvertTo-Json -Compress -Depth 4")
     rc, out = run_command([POWERSHELL, "-NoProfile", "-NonInteractive", "-Command", script], timeout=45)
     try:
         data = json.loads(out.strip().splitlines()[-1]) if rc == 0 else {}
     except (ValueError, IndexError):
         data = {}
-    return {"memory": _as_list(data.get("memory")), "gpus": _as_list(data.get("gpus")), "net": data.get("net")}
+    return {"memory": _as_list(data.get("memory")), "gpus": _as_list(data.get("gpus")), "net": data.get("net"),
+            "hvci": None if data.get("hvci") is None else _as_list(data.get("hvci"))}
 
 
 def wifi_signal() -> int | None:
@@ -3168,11 +3416,18 @@ def wifi_signal() -> int | None:
     return int(match.group(1)) if match else None
 
 
-def run_checkup() -> dict[str, dict]:
-    results = {"display": check_display(), "power": check_power()}
+def run_checkup(games: list[dict] | None = None) -> dict[str, dict]:
+    games = games or []
+    laptop = has_battery()
+    results = {"display": check_display(), "power": check_power(), "features": check_features()}
     info = checkup_system_info()
-    results["memory"] = check_memory(info["memory"], laptop=has_battery())
+    results["memory"] = check_memory(info["memory"], laptop=laptop)
     results["driver"] = check_driver(info["gpus"])
+    results["gamegpu"] = check_game_gpu(info["gpus"], laptop, games)
+    results["slot"] = check_gpu_slot(info["gpus"], laptop)
+    results["security"] = check_security(info["hvci"])
+    results["storage"] = check_storage(drive_space([g["path"] for g in games]), trim_enabled())
+    results["_setup"] = gpu_setup(info["gpus"], laptop)
     net = info["net"]
     is_wifi = bool(net) and ("802.11" in f"{net.get('media')} {net.get('ndis')}"
                              or re.search(r"wi-?fi|wireless|wlan", str(net.get("desc")), re.IGNORECASE))
@@ -3517,8 +3772,10 @@ TOOL_PAGE_BUTTONS = {"checkup": {"checkup": L_TOOL_ACTION}, "ping": L_TOOL_BUTTO
                      "startup": {"refresh": L_TOOL_ACTION}, "cleanup": {"clean": L_TOOL_ACTION},
                      "dns": {"dnstest": L_TOOL_ACTION}, "monitor": {}}
 PRIMARY_TOOL_BUTTONS = {"ping", "clean", "dnstest", "checkup"}
-L_CHECK_ROWS = {key: (78, 128 + i * 68, 628, 62) for i, (key, _title) in enumerate(CHECKUP_ITEMS)}
-L_CHECK_SCORE = (78, 104, 18, 8)  # x, y, pip width, pip height: one pip per check above the rows
+CHECK_VISIBLE = 5
+L_CHECK_SLOTS = [(78, 128 + i * 68, 628, 62) for i in range(CHECK_VISIBLE)]  # the list scrolls through these
+L_CHECK_SCORE = (78, 104, 16, 8)  # x, y, pip width, pip height: one pip per check above the rows
+L_CHECK_SCROLL = (710, 128, 3, 334)  # thin scroll track right of the rows
 L_CHECK_BTN = (112, 30)  # row action button, right-aligned in its row
 L_DNS_TABLE = (78, 100, 628, 280)
 L_DNS_ROW_Y0, L_DNS_ROW_H, DNS_ROWS = 134, 40, 6
@@ -4389,6 +4646,8 @@ class OptimizerApp(ctk.CTk):
         self.checkup_state = "idle"  # idle | running
         self.checkup: dict[str, dict] = {}
         self.checkup_at = 0.0
+        self.check_offset = 0
+        self.gpu_setup: dict | None = None
         self.sessions_live: dict[str, dict] = {}
         self.session_view: str | None = None  # a game's path while its session history is shown
         self.privacy_state: dict[str, bool] = {}
@@ -4714,7 +4973,7 @@ class OptimizerApp(ctk.CTk):
         cleanup = base.copy()
         rows(cleanup, [*L_CLEAN_ROWS.values(), L_CLEAN_BAR])
         checkup = base.copy()
-        rows(checkup, L_CHECK_ROWS.values())
+        rows(checkup, L_CHECK_SLOTS)
         rows(dns, [L_DNS_BAR])
         monitor = base.copy()
         rows(monitor, L_MONITOR.values())
@@ -4761,7 +5020,7 @@ class OptimizerApp(ctk.CTk):
         return [(0, 0, WINDOW_W, L_TITLE_H), L_RAIL_BOX, *L_ABOUT_ROWS.values(), *L_PILLS.values(), *L_CARDS.values(),
                 *L_BUTTONS.values(), L_CONSOLE, *L_TOOL_BUTTONS.values(), L_PING_TABLE, L_PING_HOST_FIELD,
                 L_SEGMENTS["tool"], L_GAME_AUTO, *L_CLEAN_ROWS.values(), L_CLEAN_BAR, L_GAME_FIND, L_GAME_ADD, L_DNS_BAR,
-                *L_CHECK_ROWS.values(),
+                *L_CHECK_SLOTS,
                 *L_MONITOR.values(),
                 *L_SETTING_ROWS.values(), L_FOLDER_ROW, *L_LOOK_ROWS.values(), L_LOOK_RESET,
                 *L_PRIV_ROWS.values(), L_PRIV_FOOT]
@@ -5139,12 +5398,11 @@ class OptimizerApp(ctk.CTk):
         sx, sy, pw, ph = L_CHECK_SCORE
         self.t_check_score = c.create_text(px(sx + len(CHECKUP_ITEMS) * (pw + 5) + 8), px(sy + ph / 2), anchor="w",
                                            font=self.f_desc, fill=TEXT_HI, tags=ck)
-        self.t_check = {}
+        self.t_check = []
         bw, bh = L_CHECK_BTN
-        for key, title in CHECKUP_ITEMS:
-            rx, ry, rw, rh = L_CHECK_ROWS[key]
-            self.t_check[key] = {
-                "title": c.create_text(px(rx + 52), px(ry + 8), anchor="nw", text=title, font=self.f_title,
+        for rx, ry, rw, rh in L_CHECK_SLOTS:
+            self.t_check.append({
+                "title": c.create_text(px(rx + 52), px(ry + 8), anchor="nw", font=self.f_title,
                                        fill=TEXT_HI, tags=ck),
                 "detail": c.create_text(px(rx + 52), px(ry + 30), anchor="nw", font=self.f_desc, fill=TEXT_MID,
                                         tags=ck),
@@ -5152,7 +5410,7 @@ class OptimizerApp(ctk.CTk):
                                        fill=TEXT_HI, tags=ck),
                 "btn": c.create_text(px(rx + rw - 20 - bw / 2), px(ry + rh / 2), font=self.f_ghost_small,
                                      fill=TEXT_HI, tags=ck),
-            }
+            })
 
         # Games
         g = tags["games"]
@@ -5805,7 +6063,7 @@ class OptimizerApp(ctk.CTk):
                 paste_layer(scene, img, px(sx + i * (pw + 5)), px(sy))
             bw, bh = L_CHECK_BTN
             mark = 22
-            for key, (rx, ry, rw, rh) in L_CHECK_ROWS.items():
+            for slot, key, (rx, ry, rw, rh) in self._check_slots():
                 result = self.checkup.get(key)
                 status = result["status"] if result else "pending"
                 img = self.painter.status_mark(px(mark), status)
@@ -5818,7 +6076,17 @@ class OptimizerApp(ctk.CTk):
                     img = self._cached(("ghost-check", state), lambda: self.painter.ghost_button(px(bw), px(bh), state))
                     paste_layer(scene, img, px(rx + rw - 20 - bw), px(ry + (rh - bh) / 2))
                     color = {"disabled": "#4D4D4D", "hover": "#FFFFFF", "pressed": "#FFFFFF"}.get(state, "#CFCFCF")
-                    self.canvas.itemconfigure(self.t_check[key]["btn"], fill=color)
+                    self.canvas.itemconfigure(self.t_check[slot]["btn"], fill=color)
+            if len(CHECKUP_ITEMS) > CHECK_VISIBLE:  # scroll position
+                tx, ty, tw, th = L_CHECK_SCROLL
+                track = self._cached(("chk-track", th), lambda: self.painter.shape(
+                    px(tw), px(th), px(tw / 2), fill=rgba(STARLIGHT, 22)))
+                paste_layer(scene, track, px(tx), px(ty))
+                span = th * CHECK_VISIBLE / len(CHECKUP_ITEMS)
+                top = ty + (th - span) * self.check_offset / (len(CHECKUP_ITEMS) - CHECK_VISIBLE)
+                thumb = self._cached(("chk-thumb", span), lambda: self.painter.shape(
+                    px(tw), px(span), px(tw / 2), fill=rgba(STARLIGHT, 120)))
+                paste_layer(scene, thumb, px(tx), px(top))
         if self.tool_page == "games" and not self.game_finder:
             for i, row in enumerate(self.t_games):
                 if self.hover == f"game:report:{self.game_offset + i}":
@@ -6035,7 +6303,7 @@ class OptimizerApp(ctk.CTk):
                 return "host:field"
             if self.tool_page == "checkup":
                 bw, bh = L_CHECK_BTN
-                for key, (rx, ry, rw, rh) in L_CHECK_ROWS.items():
+                for _slot, key, (rx, ry, rw, rh) in self._check_slots():
                     if (self.checkup.get(key) or {}).get("action") \
                             and inside((rx + rw - 20 - bw, ry + (rh - bh) / 2, bw, bh)):
                         return f"chk:{key}"
@@ -6526,10 +6794,13 @@ class OptimizerApp(ctk.CTk):
             self.after(30, self._load_dns_info)
 
     def _on_canvas_wheel(self, event) -> None:
-        if self.dialog or self.tab != "tools" or self.tool_page not in ("games", "startup"):
+        if self.dialog or self.tab != "tools" or self.tool_page not in ("games", "startup", "checkup"):
             return
         step = -1 if event.delta > 0 else 1
-        if self.tool_page == "games":
+        if self.tool_page == "checkup":
+            self.check_offset = max(0, min(len(CHECKUP_ITEMS) - CHECK_VISIBLE, self.check_offset + step))
+            self._paint_checkup()
+        elif self.tool_page == "games":
             if self.game_finder:
                 total = len(self.game_finder.get("items", []))
             elif self.session_view:
@@ -6830,6 +7101,10 @@ class OptimizerApp(ctk.CTk):
                     self._on_privacy(*event[1:])
                 elif kind == "display-fixed":
                     self._on_display_fixed(event[1])
+                elif kind == "checkup-fixed":
+                    self._on_checkup_fixed(*event[1:])
+                elif kind == "gpu-setup":
+                    self.gpu_setup = event[1]
                 elif kind == "session-ping":
                     for session in self.sessions_live.values():
                         session["pings"].append(event[1])
@@ -6933,6 +7208,7 @@ class OptimizerApp(ctk.CTk):
         if self._setting("updates"):
             self._schedule_update_check(4000)  # after startup has settled
         self.after(90 * 1000, self._weekly_cleanup_tick)
+        self._detect_gpu_setup()
 
     def _start_tray(self) -> bool:
         if self.tray is not None:
@@ -7334,10 +7610,13 @@ class OptimizerApp(ctk.CTk):
             self._emit("info", f"{os.path.basename(path)} is already in your games")
             return
         name = exe_display_name(path)
-        self.games.append({"path": path, "name": name, "priority": True, "fso_by_us": False})
+        game = {"path": path, "name": name, "priority": True, "fso_by_us": False}
+        self.games.append(game)
         self.games.sort(key=lambda g: g.get("name", "").lower())
+        pinned = self._pin_fast_gpu([game])
         self._save_games()
-        self._emit("ok", f"{name} added - it gets high CPU priority whenever it runs")
+        self._emit("ok", f"{name} added - it gets high CPU priority whenever it runs"
+                         + (f" and runs on the {self.gpu_setup['fast']}" if pinned else ""))
         self._paint_games()
         self._render()
 
@@ -7382,6 +7661,11 @@ class OptimizerApp(ctk.CTk):
                     set_fso_disabled(path, False)
                 except OSError:
                     pass
+            if game.get("gpu_by_us") and gpu_preference(path) == 2:
+                try:
+                    set_gpu_preference(path, None)  # back to "Let Windows decide"
+                except OSError:
+                    pass
             del self.games[index]
             self.game_offset = max(0, min(self.game_offset, len(self.games) - GAME_ROWS))
             self._save_games()
@@ -7408,8 +7692,10 @@ class OptimizerApp(ctk.CTk):
         c = self.canvas
         c.itemconfigure(self.t_check_score, text=self._checkup_score())
         bw = L_CHECK_BTN[0]
-        for key, _title in CHECKUP_ITEMS:
-            items, (rx, _ry, rw, _rh) = self.t_check[key], L_CHECK_ROWS[key]
+        titles = dict(CHECKUP_ITEMS)
+        for slot, key, (rx, _ry, rw, _rh) in self._check_slots():
+            items = self.t_check[slot]
+            c.itemconfigure(items["title"], text=titles[key])
             result = self.checkup.get(key)
             if result is None:
                 text = "Checking…" if self.checkup_state == "running" else "Not checked yet."
@@ -7424,6 +7710,43 @@ class OptimizerApp(ctk.CTk):
             c.itemconfigure(items["detail"], text=result["detail"], width=self.px(room))
             c.itemconfigure(items["value"], text=value)
             c.itemconfigure(items["btn"], text=action[1] if action else "")
+
+    def _check_slots(self):
+        """(slot, key, rect) for the checks currently scrolled into view."""
+        for slot, rect in enumerate(L_CHECK_SLOTS):
+            index = self.check_offset + slot
+            if index < len(CHECKUP_ITEMS):
+                yield slot, CHECKUP_ITEMS[index][0], rect
+
+    def _pin_fast_gpu(self, games: list[dict]) -> bool:
+        """On a laptop with two graphics chips, start these games on the strong one (unless the user
+        already chose something for them in Windows)."""
+        if not (self.gpu_setup and self.gpu_setup.get("hybrid")):
+            return False
+        pinned = False
+        for game in games:
+            try:
+                if gpu_preference(game["path"]) is None:
+                    set_gpu_preference(game["path"], 2)
+                    game["gpu_by_us"] = True
+                    pinned = True
+            except OSError:
+                continue
+        return pinned
+
+    def _detect_gpu_setup(self) -> None:
+        """Laptops only: find out early whether there are two graphics chips, for new games."""
+        if not has_battery():
+            return
+
+        def work() -> None:
+            try:
+                setup = gpu_setup(checkup_system_info()["gpus"], True)
+            except Exception:
+                return
+            self.events.put(("gpu-setup", setup))
+
+        threading.Thread(target=work, name="gpu-setup", daemon=True).start()
 
     def _maybe_auto_checkup(self) -> None:
         """First visit (or a stale result): run it straight away, it only reads."""
@@ -7440,7 +7763,7 @@ class OptimizerApp(ctk.CTk):
 
         def work() -> None:
             try:
-                results = run_checkup()
+                results = run_checkup([dict(g) for g in self.games])
             except Exception as exc:
                 results = {"error": str(exc) or type(exc).__name__}
             self.events.put(("checkup", results))
@@ -7450,6 +7773,8 @@ class OptimizerApp(ctk.CTk):
     def _on_checkup(self, results: dict) -> None:
         self.checkup_state, self.checkup_at = "idle", time.monotonic()
         error = results.pop("error", None) if isinstance(results, dict) else "no results"
+        if isinstance(results, dict) and "_setup" in results:
+            self.gpu_setup = results.pop("_setup")
         if error:
             self._emit("fail", f"Checkup failed: {error}")
         self.checkup = results
@@ -7471,12 +7796,74 @@ class OptimizerApp(ctk.CTk):
         if action[0] == "link":
             self._open_link(action[2])
             return
+        if action[0] == "cleanup":
+            self._switch_tool_page("cleanup")
+            return
+        if action[0] == "gamegpu":
+            paths = [os.path.normcase(p) for p in result.get("games", [])]
+            names = [self._game_name(p) for p in paths]
+            body = (", ".join(names[:6]) + (f" and {len(names) - 6} more" if len(names) > 6 else "")
+                    + f" will start on the {result.get('fast', 'graphics card')} from now on. Removing a game from "
+                      "Astra puts its setting back.")
+            self._open_dialog("Use the fast graphics chip?", body, action[1], lambda: self._fix_game_gpu(paths))
+            return
+        if action[0] == "features":
+            body = ("Turns on " + ", ".join(result.get("off", [])) + ". GPU scheduling takes effect after a "
+                    "restart.\n\nYou can change these back in Windows Settings under Gaming and Display > Graphics.")
+            self._open_dialog("Turn on gaming features?", body, action[1],
+                              lambda: self._run_fix("Gaming features", lambda: fix_features(self.admin)))
+            return
+        if action[0] == "trim":
+            def trim() -> list[str]:
+                rc, out = run_command(["fsutil", "behavior", "set", "DisableDeleteNotify", "0"], timeout=20)
+                return [] if rc == 0 else [first_line(out) or f"fsutil failed ({rc})"]
+            self._open_dialog("Turn on TRIM?", "Windows will tell your SSDs which space is free again, which keeps "
+                              "them fast. This is the Windows default.", action[1], lambda: self._run_fix("TRIM", trim))
+            return
         if action[0] == "display":
             fixes = result["fix"]
             lines = [f"{label}: {old} Hz → {hz} Hz" for _device, hz, label, old in fixes]
             body = ("\n".join(lines) + "\n\nThe screen may go black for a moment while it switches. "
                     "You can change it back in Windows display settings.")
             self._open_dialog("Use the highest refresh rate?", body, action[1], lambda: self._fix_display(fixes))
+
+    def _fix_game_gpu(self, paths: list[str]) -> None:
+        games = [g for g in self.games if os.path.normcase(g["path"]) in paths]
+        failed = 0
+        for game in games:
+            try:
+                set_gpu_preference(game["path"], 2)
+                game["gpu_by_us"] = True
+            except OSError:
+                failed += 1
+        self._save_games()
+        fast = (self.checkup.get("gamegpu") or {}).get("fast", "fast graphics chip")
+        self._emit("ok" if not failed else "warn",
+                   f"{plural(len(games) - failed, 'game')} now start on the {fast}"
+                   + (f", {failed} couldn't be changed" if failed else ""))
+        self._run_checkup()
+
+    def _run_fix(self, label: str, work_fn) -> None:
+        """Run a checkup fix off the UI thread, then check again."""
+        self.checkup_state = "running"
+        self._render()
+
+        def work() -> None:
+            try:
+                failed = work_fn()
+            except Exception as exc:
+                failed = [str(exc)]
+            self.events.put(("checkup-fixed", label, failed))
+
+        threading.Thread(target=work, name="checkup-fix", daemon=True).start()
+
+    def _on_checkup_fixed(self, label: str, failed: list) -> None:
+        if failed:
+            self._emit("warn", f"{label}: not everything changed - {'; '.join(failed)}")
+        else:
+            self._emit("ok", f"{label}: turned on")
+        self.checkup_state = "idle"
+        self._run_checkup()
 
     def _fix_display(self, fixes: list) -> None:
         self.checkup_state = "running"
@@ -7841,10 +8228,14 @@ class OptimizerApp(ctk.CTk):
     def _add_found_games(self) -> None:
         picked = [g for g in (self.game_finder or {}).get("items", []) if g["pick"]]
         known = {os.path.normcase(g["path"]) for g in self.games}
+        added = []
         for game in picked:
             if os.path.normcase(game["path"]) not in known:
-                self.games.append({"path": game["path"], "name": game["name"], "priority": True, "fso_by_us": False})
+                added.append({"path": game["path"], "name": game["name"], "priority": True, "fso_by_us": False})
+        self.games.extend(added)
         self.games.sort(key=lambda g: g.get("name", "").lower())
+        if self._pin_fast_gpu(added):
+            self._emit("ok", f"New games will run on the {self.gpu_setup['fast']}")
         self.game_finder = None
         self.game_offset = 0
         self._save_games()

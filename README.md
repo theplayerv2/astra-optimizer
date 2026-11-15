@@ -19,17 +19,17 @@ returns your PC to exactly how *you* had it, not to Windows defaults.
 
 | Mode | What changes |
 |---|---|
-| **Max FPS** | Ultimate Performance power plan, visual effects set for performance (ClearType stays on), Game Bar capture off and Game Mode on, DNS cache flushed, background services paused until restart (SysMain, telemetry, Search indexer and a few others), and a deep RAM cleanup |
-| **Cozy Mode** | High Performance power plan, a gentle RAM cleanup that leaves Discord, Spotify, browsers and the window in front alone, GPU scheduling on, smooth animations |
+| **Max FPS** | Ultimate Performance power plan, visual effects set for performance (ClearType stays on), Game Bar capture off and Game Mode on, optimizations for windowed games and variable refresh rate on, DNS cache flushed, background services paused until restart (SysMain, telemetry, Search indexer and a few others), and a deep RAM cleanup |
+| **Cozy Mode** | High Performance power plan, a gentle RAM cleanup that leaves Discord, Spotify, browsers and the window in front alone, GPU scheduling on, optimizations for windowed games and variable refresh rate on, smooth animations |
 | **Best Looking** | Full visual effects with transparency and ClearType, Search and SysMain running again, Game Bar back to its defaults (Balanced power plan on laptops running on battery) |
 
 Before anything runs you see a preview of what will change on *your* PC, and afterwards a short summary.
 
 ### Tools
 
-- **Checkup**: one scan for settings that quietly cost performance: a monitor below its top refresh rate (fixed in one click), RAM below its rated speed (XMP/EXPO off), an old graphics driver, playing on Wi-Fi or a slow cable link, and a laptop on battery, with a score for how many look good.
+- **Checkup**: one scan for settings that quietly cost performance: a monitor below its top refresh rate (fixed in one click), RAM below its rated speed (XMP/EXPO off), an old graphics driver, games running on a laptop's built-in graphics instead of its fast GPU, a graphics card in a slow slot, Game Mode or windowed-game optimizations off, Memory Integrity's FPS cost (explained, never changed for you), a nearly full drive or TRIM off, Wi-Fi or a slow cable link, and a laptop on battery. A score shows how many look good.
 - **Ping**: latency, jitter and packet loss to your router, Cloudflare, Google, several cloud regions and any server you type in.
-- **Games**: add games by hand or let **Find games** scan Steam, Epic Games, Riot and GOG. Each game gets high CPU priority whenever it runs, is kept out of Windows' power throttling (EcoQoS), an optional *fullscreen optimizations off* switch, and an option to apply your mode while it runs and undo it when it closes.
+- **Games**: add games by hand or let **Find games** scan Steam, Epic Games, Riot and GOG. Each game gets high CPU priority whenever it runs, is kept out of Windows' power throttling (EcoQoS), runs on the fast GPU on laptops with two graphics chips, an optional *fullscreen optimizations off* switch, and an option to apply your mode while it runs and undo it when it closes.
 - **Session reports**: when a game closes you get a summary of how long you played, CPU and GPU load, the hottest GPU temperature and ping spikes. Click a game to see all its sessions side by side, with averages, and open any of them.
 - **Startup**: turn apps that launch with Windows on or off, using the same switches as Task Manager.
 - **Cleanup**: clears old files from your temp folders, crash reports, Discord's cache, used Windows Update downloads and the Delivery Optimization cache. Only files untouched for a day are removed, and it asks first. It can also run by itself once a week, never while a game is running.
