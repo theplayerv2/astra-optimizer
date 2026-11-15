@@ -501,6 +501,31 @@ SWP_SHOWWINDOW = 0x0040
 PW_RENDERFULLCONTENT = 0x00000002
 
 
+_icon_api = ctypes.WinDLL("user32")  # private function objects for the taskbar icon
+_icon_api.LoadImageW.argtypes = [wintypes.HINSTANCE, wintypes.LPCWSTR, wintypes.UINT, ctypes.c_int, ctypes.c_int,
+                                 wintypes.UINT]
+_icon_api.LoadImageW.restype = wintypes.HANDLE
+_icon_api.SendMessageW.argtypes = [wintypes.HWND, wintypes.UINT, wintypes.WPARAM, wintypes.LPARAM]
+_icon_api.SendMessageW.restype = ctypes.c_ssize_t
+WM_SETICON, ICON_SMALL, ICON_BIG = 0x0080, 0, 1
+IMAGE_ICON, LR_LOADFROMFILE = 1, 0x10
+APP_USER_MODEL_ID = "theplayerv2.AstraOptimizer"
+
+
+def set_window_icons(hwnd: int, ico_path: str, scale: float) -> list:
+    """Give a window its own big (taskbar, Alt+Tab) and small icons from an .ico file. Returns the
+    icon handles, which must stay alive as long as the window does."""
+    handles = []
+    if not os.path.isfile(ico_path):
+        return handles
+    for kind, size in ((ICON_BIG, max(32, round(32 * scale))), (ICON_SMALL, max(16, round(16 * scale)))):
+        handle = _icon_api.LoadImageW(None, ico_path, IMAGE_ICON, size, size, LR_LOADFROMFILE)
+        if handle:
+            _icon_api.SendMessageW(hwnd, WM_SETICON, kind, handle)
+            handles.append(handle)
+    return handles
+
+
 def capture_window(hwnd: int):
     """Exactly what a window shows right now (text and child widgets included), as an RGB image."""
     from PIL import Image as _Image
@@ -5506,6 +5531,9 @@ class OptimizerApp(ctk.CTk):
             user32.SetWindowLongPtrW(hwnd, GWL_EXSTYLE, (ex & ~WS_EX_TOOLWINDOW) | WS_EX_APPWINDOW)
             style = user32.GetWindowLongPtrW(hwnd, GWL_STYLE)
             user32.SetWindowLongPtrW(hwnd, GWL_STYLE, style | WS_MINIMIZEBOX | WS_SYSMENU)
+            # The frameless restyle leaves the window without an icon of its own, and the taskbar reads
+            # that first, so give it ours directly (Tk's iconbitmap doesn't reach it here).
+            self._hicons = set_window_icons(hwnd, resource_path("assets", "icon.ico"), self.scale)
             if dwmapi is not None:
                 corner = ctypes.c_int(DWMWCP_ROUND)
                 dwmapi.DwmSetWindowAttribute(hwnd, DWMWA_WINDOW_CORNER_PREFERENCE, ctypes.byref(corner), 4)
@@ -9940,6 +9968,10 @@ def main() -> None:
         write_icon_files(args[index + 1] if index + 1 < len(args) else resource_path("assets"))
         return
     no_elevate = "--no-elevate" in args
+    try:  # own taskbar identity: groups and pins as Astra Optimizer, with its own icon
+        ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID(APP_USER_MODEL_ID)
+    except (AttributeError, OSError):
+        pass
     if signal_running_instance():
         return  # already running (maybe in the tray): it shows itself
     admin = is_admin()

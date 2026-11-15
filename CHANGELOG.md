@@ -26,6 +26,10 @@ When a version is tagged on GitHub (for example `v1.2.0`), its section below bec
 ### Changed
 - The Games page's bottom row holds two switches: apply your mode while a game runs, and show the overlay.
 
+### Fixed
+- The taskbar showed a generic icon instead of Astra's; the window now carries its own icon and Windows groups
+  and pins it as Astra Optimizer.
+
 ## v1.2.0 - 2026-11-15
 
 ### Added
