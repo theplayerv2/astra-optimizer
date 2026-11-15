@@ -50,6 +50,7 @@ Six switches for ads and tracking built into Windows: ads and suggested apps in 
 - Starfield, plain black or your own picture as the background, with blur, dim, panel opacity and frost.
 - Motion: follow Windows, Full, Reduced or Off.
 - Keep running in the tray, start with Windows (elevated, no UAC prompt), a global hotkey (**Ctrl+Alt+O**) to toggle your mode in-game, an optional System Restore point before your first optimize each day, a check for new versions, and **Back up / Restore** to move your settings, games, appearance and session history to another PC in one file.
+- **Report a problem** (About tab or tray menu) saves one zip to your desktop with your PC specs, a fresh checkup, your last game sessions and the app's log and settings, ready to send with a bug report.
 
 | | |
 |---|---|
@@ -72,9 +73,10 @@ administrator rights, so Windows asks once (UAC). Without them it still opens, b
 Every release is built by GitHub Actions straight from that version's source code, and its notes list
 the exe's SHA-256 checksum. What changed in each version is in [CHANGELOG.md](CHANGELOG.md).
 
-When a newer version comes out, the About tab shows a **Download** button that opens its release page.
-Astra Optimizer only checks; it never downloads or installs anything by itself, and you can turn the
-check off in Settings.
+When a newer version comes out, the About tab shows **Update to vN.N.N**. Clicking it downloads that
+release's exe from GitHub, checks it against the SHA-256 in the release notes, and restarts Astra on the
+new version; your settings, games and any applied mode carry over. Nothing downloads until you click,
+and you can turn the check off in Settings.
 
 The exe isn't code-signed, so the first launch may show *Windows protected your PC*. Choose **More info**
 and then **Run anyway**, or build it yourself from source.
@@ -126,7 +128,7 @@ Settings, the undo snapshot, your background picture and the log are stored in
 
 ## Credits
 
-Made by **theplayerv2**: [guns.lol/playerv2](https://guns.lol/playerv2)
+Made by **theplayerv2** ([GitHub](https://github.com/theplayerv2)).
 
 Built with Python, [customtkinter](https://github.com/TomSchimansky/CustomTkinter),
 [Pillow](https://python-pillow.org), [psutil](https://github.com/giampaolo/psutil),

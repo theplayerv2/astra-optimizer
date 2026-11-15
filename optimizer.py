@@ -56,11 +56,11 @@ except Exception:  # pragma: no cover - depends on the build
 
 APP_NAME = "Astra Optimizer"
 LEGACY_APP_NAME = "Optimizer"  # pre-1.12 name: data folder and startup task are carried over
-APP_VERSION = "1.3.0"
-DISPLAY_VERSION = "v1.3.0"
+APP_VERSION = "1.4.0"
+DISPLAY_VERSION = "v1.4.0"
 CREDIT_NAME = "theplayerv2"
-CREDIT_URL = "https://guns.lol/playerv2"
 UPDATE_REPO = "theplayerv2/astra-optimizer"
+CREDIT_URL = f"https://github.com/{UPDATE_REPO}"
 RELEASES_URL = f"https://github.com/{UPDATE_REPO}/releases"
 UPDATE_API = f"https://api.github.com/repos/{UPDATE_REPO}/releases/latest"
 UPDATE_INTERVAL_MS = 12 * 3600 * 1000  # re-check while it stays open in the tray
@@ -2212,12 +2212,243 @@ def fetch_latest_release(timeout: float = 8.0) -> dict | None:
     url = str(data.get("html_url") or "")
     if not url.startswith(RELEASES_URL + "/"):  # only ever open this project's own release pages
         url = RELEASES_URL
-    return {"tag": tag, "url": url}
+    release = {"tag": tag, "url": url}
+    asset = next((a for a in data.get("assets") or [] if isinstance(a, dict) and a.get("name") == UPDATE_ASSET), None)
+    download = str((asset or {}).get("browser_download_url") or "")
+    checksum = re.search(r"SHA-256:\s*`?([0-9a-fA-F]{64})\b", str(data.get("body") or ""))
+    # Self-update only from this project's own release files, and only with a checksum to verify against.
+    if download.startswith(UPDATE_DOWNLOAD_PREFIX) and checksum:
+        release.update(download=download, size=int(asset.get("size") or 0), sha256=checksum.group(1).lower())
+    return release
 
 
 def display_tag(tag: str) -> str:
     tag = tag.strip()
     return tag if tag[:1] in "vV" else f"v{tag}"
+
+
+# --------------------------------------------------------------------------------------
+# In-app updates. The release's exe is downloaded next to the running one and checked against
+# the SHA-256 in the release notes. Windows won't let a running exe be overwritten but does let
+# it be renamed, so the old one moves aside to "<name>.old", the new one takes its place and is
+# started with --updated; that copy waits for this one to close and then deletes the .old file.
+# --------------------------------------------------------------------------------------
+
+UPDATE_ASSET = "Astra.Optimizer.exe"
+UPDATE_DOWNLOAD_PREFIX = f"https://github.com/{UPDATE_REPO}/releases/download/"
+UPDATE_MAX_BYTES = 300 * 1024 * 1024
+DETACHED_PROCESS = 0x00000008
+CREATE_NEW_PROCESS_GROUP = 0x00000200
+
+
+def download_update(release: dict, dest: str, progress=None, timeout: float = 30.0) -> None:
+    """Download the release exe to dest. Raises OSError/ValueError; dest only appears once verified."""
+    import hashlib
+    import urllib.request
+    request = urllib.request.Request(release["download"], headers={"User-Agent": f"Astra-Optimizer/{APP_VERSION}"})
+    partial = dest + ".part"
+    digest, done, shown = hashlib.sha256(), 0, -1
+    try:
+        with urllib.request.urlopen(request, timeout=timeout) as response, open(partial, "wb") as fh:
+            total = int(response.headers.get("Content-Length") or release.get("size") or 0)
+            while True:
+                chunk = response.read(256 * 1024)
+                if not chunk:
+                    break
+                done += len(chunk)
+                if done > UPDATE_MAX_BYTES:
+                    raise ValueError("the download is far bigger than expected")
+                digest.update(chunk)
+                fh.write(chunk)
+                percent = min(99, done * 100 // total) if total else 0
+                if progress is not None and percent != shown:
+                    shown = percent
+                    progress(percent)
+        if digest.hexdigest() != release["sha256"]:
+            raise ValueError("the download doesn't match the release's SHA-256 checksum")
+        with open(partial, "rb") as fh:
+            if fh.read(2) != b"MZ":
+                raise ValueError("the download isn't a Windows program")
+        os.replace(partial, dest)
+    except BaseException:
+        try:
+            os.remove(partial)
+        except OSError:
+            pass
+        raise
+
+
+def install_update(exe: str, new_file: str) -> str:
+    """Swap new_file in for the (running) exe. Returns where the old exe went."""
+    old = exe + ".old"
+    try:
+        os.remove(old)
+    except FileNotFoundError:
+        pass
+    except OSError:  # still locked by a copy that hasn't fully closed yet
+        old = f"{exe}.{int(time.time())}.old"
+    os.replace(exe, old)
+    try:
+        os.replace(new_file, exe)
+    except OSError:
+        os.replace(old, exe)  # put the running version back
+        raise
+    return old
+
+
+def launch_updated(exe: str) -> None:
+    """Start the freshly installed exe as a clean, separate process."""
+    env = {k: v for k, v in os.environ.items() if not k.startswith("_PYI") and k != "_MEIPASS2"}
+    env["PYINSTALLER_RESET_ENVIRONMENT"] = "1"  # don't reuse this process's unpacked files
+    args = [exe, "--updated"] + [a for a in sys.argv[1:] if a == "--no-elevate"]
+    try:
+        subprocess.Popen(args, env=env, cwd=os.path.dirname(exe) or None, close_fds=True,
+                         creationflags=DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP)
+    except OSError as exc:
+        if getattr(exc, "winerror", None) != 740:  # ERROR_ELEVATION_REQUIRED: this copy runs without admin
+            raise
+        os.environ.clear()  # ShellExecute passes this process's environment on; it exits right after
+        os.environ.update(env)
+        result = shell32.ShellExecuteW(None, "open", exe, subprocess.list2cmdline(args[1:]),
+                                       os.path.dirname(exe) or None, 1)
+        if int(result or 0) <= 32:
+            raise OSError(f"Windows couldn't start the new version (code {result})") from exc
+
+
+def wait_for_previous_instance(timeout: float = 30.0) -> None:
+    """After an update: wait until the old copy has closed its instance event (it exits right away)."""
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        handle = kernel32.OpenEventW(EVENT_MODIFY_STATE, False, INSTANCE_EVENT)
+        if not handle:
+            return
+        kernel32.CloseHandle(handle)
+        time.sleep(0.25)
+
+
+def update_leftovers(exe: str) -> list[str]:
+    folder, name = os.path.split(exe)
+    try:
+        entries = os.listdir(folder or ".")
+    except OSError:
+        return []
+    pattern = re.compile(re.escape(name) + r"(\.\d+)?\.old$|" + re.escape(name) + r"\.download(\.part)?$",
+                         re.IGNORECASE)
+    return [os.path.join(folder, e) for e in entries if pattern.match(e)]
+
+
+def remove_update_leftovers(exe: str, attempts: int = 40) -> None:
+    """Delete the previous version's exe; it can stay locked for a moment while that copy exits."""
+    for _ in range(attempts):
+        left = []
+        for path in update_leftovers(exe):
+            try:
+                os.remove(path)
+            except FileNotFoundError:
+                pass
+            except OSError:
+                left.append(path)
+        if not left:
+            return
+        time.sleep(1.5)
+
+
+# --------------------------------------------------------------------------------------
+# Problem reports: one zip with what's needed to understand a bug report from someone else's PC.
+# --------------------------------------------------------------------------------------
+
+
+def desktop_folder() -> str:
+    buffer = ctypes.create_unicode_buffer(260)
+    try:
+        if ctypes.windll.shell32.SHGetFolderPathW(None, 0x0010, None, 0, buffer) == 0 and buffer.value:
+            return buffer.value  # CSIDL_DESKTOPDIRECTORY - follows OneDrive's moved Desktop too
+    except (AttributeError, OSError):
+        pass
+    return os.path.join(os.path.expanduser("~"), "Desktop")
+
+
+def _reg_text(path: str, name: str) -> str:
+    try:
+        with winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE, path) as key:
+            return str(winreg.QueryValueEx(key, name)[0])
+    except OSError:
+        return ""
+
+
+def windows_description() -> str:
+    nt = r"SOFTWARE\Microsoft\Windows NT\CurrentVersion"
+    product, release = _reg_text(nt, "ProductName") or "Windows", _reg_text(nt, "DisplayVersion")
+    build, ubr = _reg_text(nt, "CurrentBuild"), _reg_text(nt, "UBR")
+    if build.isdigit() and int(build) >= 22000:  # Windows 11 still says "Windows 10" in ProductName
+        product = product.replace("Windows 10", "Windows 11")
+    return " ".join(part for part in (product, release, f"(build {build}.{ubr})" if build else "") if part)
+
+
+def cpu_description() -> str:
+    name = _reg_text(r"HARDWARE\DESCRIPTION\System\CentralProcessor\0", "ProcessorNameString").strip()
+    cores, threads = psutil.cpu_count(logical=False), psutil.cpu_count(logical=True)
+    return f"{name or 'Unknown CPU'} ({cores} cores, {threads} threads)"
+
+
+def problem_report_text(app_info: dict, system: dict, checkup: dict, sessions: list[dict]) -> str:
+    gb = psutil.virtual_memory().total / 1024 ** 3
+    lines = [f"{APP_NAME} problem report", f"Made {_dt.datetime.now():%Y-%m-%d %H:%M}", "",
+             "PC", f"  Windows: {windows_description()}", f"  CPU: {cpu_description()}", f"  RAM: {gb:.1f} GB"]
+    for module in system.get("memory") or []:
+        lines.append(f"    {module.get('part', '').strip() or 'module'}: {module.get('configured') or '?'} MT/s "
+                     f"(rated {module.get('speed') or '?'})")
+    for gpu in system.get("gpus") or []:
+        lines.append(f"  GPU: {gpu.get('name')} - driver {gpu.get('version')} ({gpu.get('date') or 'no date'})")
+    lines.append(f"  Laptop: {'yes' if has_battery() else 'no'}")
+    net = system.get("net") or {}
+    if net:
+        lines.append(f"  Network: {net.get('desc') or net.get('name')}")
+    lines += ["", "Astra"] + [f"  {key}: {value}" for key, value in app_info.items()]
+    lines += ["", "Checkup"]
+    for key, title in CHECKUP_ITEMS:
+        row = checkup.get(key) or {}
+        value = f" - {row['value']}" if row.get("value") else ""
+        lines.append(f"  [{row.get('status', '?')}] {title}{value}: {row.get('detail', '')}")
+    if checkup.get("error"):
+        lines.append(f"  Checkup failed: {checkup['error']}")
+    lines += ["", f"Last {len(sessions)} game session{'s' if len(sessions) != 1 else ''}" if sessions
+              else "No game sessions yet"]
+    for report in reversed(sessions):
+        lines.append(f"  {report.get('name') or os.path.basename(report.get('exe', '')) or 'Game'}")
+        try:
+            lines += [f"    {line}" for line in session_report_text(report).splitlines() if line]
+        except (KeyError, TypeError, ValueError):
+            lines.append("    (report incomplete)")
+    return "\n".join(lines) + "\n"
+
+
+def write_problem_report(path: str, app_info: dict, games: list[dict], sessions: list[dict], state_file: str) -> None:
+    import zipfile
+    system = checkup_system_info()
+    try:
+        checkup = run_checkup(games, info=system)
+    except Exception as exc:
+        checkup = {"error": str(exc) or type(exc).__name__}
+    checkup.pop("_setup", None)
+    text = problem_report_text(app_info, system, checkup, sessions)
+    partial = path + ".part"
+    try:
+        with zipfile.ZipFile(partial, "w", zipfile.ZIP_DEFLATED) as zf:
+            zf.writestr("report.txt", text)
+            zf.writestr("details.json", json.dumps({"app": app_info, "system": system, "checkup": checkup,
+                                                    "sessions": sessions}, indent=2, default=str))
+            for source, name in ((LOG_FILE, "optimizer.log"), (LOG_FILE + ".old", "optimizer.log.old"),
+                                 (state_file, "settings.json")):
+                if os.path.isfile(source):
+                    zf.write(source, name)
+        os.replace(partial, path)
+    except BaseException:
+        try:
+            os.remove(partial)
+        except OSError:
+            pass
+        raise
 
 
 class HotkeyThread(threading.Thread):
@@ -2378,6 +2609,7 @@ class TrayIcon:
             pystray.MenuItem("Mode", pystray.Menu(*modes)),
             pystray.MenuItem(f"Overlay ({OVERLAY_HOTKEY_LABEL})", send("overlay"),
                              checked=lambda item: app.overlay_visible()),
+            pystray.MenuItem("Report a problem", send("report"), enabled=lambda item: not app.report_busy),
             pystray.Menu.SEPARATOR,
             pystray.MenuItem(f"Exit {APP_NAME}", send("exit")),
         )
@@ -3639,11 +3871,11 @@ def wifi_signal() -> int | None:
     return int(match.group(1)) if match else None
 
 
-def run_checkup(games: list[dict] | None = None) -> dict[str, dict]:
+def run_checkup(games: list[dict] | None = None, info: dict | None = None) -> dict[str, dict]:
     games = games or []
     laptop = has_battery()
     results = {"display": check_display(), "power": check_power(), "features": check_features()}
-    info = checkup_system_info()
+    info = info or checkup_system_info()
     results["memory"] = check_memory(info["memory"], laptop=laptop)
     results["driver"] = check_driver(info["gpus"])
     results["gamegpu"] = check_game_gpu(info["gpus"], laptop, games)
@@ -4137,8 +4369,9 @@ TAB_SPECS = {"boost": ("Boost", "comet"), "tools": ("Tools", "signal"), "privacy
 L_ABOUT_ROWS = {"app": (78, 52, 628, 136), "credits": (78, 198, 628, 128), "info": (78, 336, 628, 130)}
 L_ABOUT_ICON = (100, 74, 92)          # x, y, size
 L_ABOUT_AVATAR = (100, 220, 84)
-L_ABOUT_PROFILE = (546, 242, 140, 40)
-L_ABOUT_LINK = (204, 286, 150, 20)    # the link text itself is clickable too
+L_ABOUT_REPORT = (546, 216, 140, 40)
+L_ABOUT_PROFILE = (546, 268, 140, 40)  # "GitHub page"
+L_ABOUT_LINK = (204, 286, 250, 20)    # the link text itself is clickable too
 L_ABOUT_UPDATE = (546, 74, 140, 40)   # "Check for updates" / "Download v…"
 L_RAIL_BOX = (6, 44, 60, 422)                  # floating glass box holding the tabs
 L_TABS = {key: (9, 52 + i * 69, 54, 58) for i, key in enumerate(TAB_ORDER)}
@@ -5359,8 +5592,11 @@ class OptimizerApp(ctk.CTk):
         self.painter.glass = self.look["glass"] / 100
         self._bg_cache: dict = {}
         self._bg_version = 0
-        self.update_state = "idle"  # idle | checking | current | available | failed
+        self.update_state = "idle"  # idle | checking | current | available | downloading | ready | failed
         self.update_info: dict | None = None
+        self.update_progress = 0
+        self.update_file: str | None = None
+        self.report_busy = False
         self._update_job = None
         self._backdrop_job = None
         self._slider_drag: str | None = None
@@ -6067,8 +6303,11 @@ class OptimizerApp(ctk.CTk):
         self.t_about_link = c.create_text(px(nx), px(y + 78), anchor="nw", font=self.f_desc, fill=SILVER, tags=ab,
                                           text=CREDIT_URL.replace("https://", ""))
         bx, by, bw, bh = L_ABOUT_PROFILE
-        self.t_buttons["profile"] = c.create_text(px(bx + bw / 2), px(by + bh / 2), text="Visit profile",
+        self.t_buttons["profile"] = c.create_text(px(bx + bw / 2), px(by + bh / 2), text="GitHub page",
                                                   font=self.f_ghost, fill=TEXT_HI, tags=ab)
+        bx, by, bw, bh = L_ABOUT_REPORT
+        self.t_buttons["report"] = c.create_text(px(bx + bw / 2), px(by + bh / 2), text="Report a problem",
+                                                 font=self.f_ghost, fill=TEXT_HI, tags=ab)
         x, y, w, h = L_ABOUT_ROWS["info"]
         for i, (label, value, font) in enumerate((
                 ("License", "MIT - free to use, change and share", self.f_desc),
@@ -6555,8 +6794,10 @@ class OptimizerApp(ctk.CTk):
             return self.tab == "settings"
         if key == "profile":
             return self.tab == "about"
+        if key == "report":
+            return self.tab == "about" and not self.report_busy
         if key == "update":
-            return self.tab == "about" and self.update_state != "checking"
+            return self.tab == "about" and self.update_state not in ("checking", "downloading")
         if kind == "priv":
             return self.tab == "privacy" and not self._privacy_busy and (self.admin or not privacy_needs_admin(key))
         if key == "privall":
@@ -6709,7 +6950,7 @@ class OptimizerApp(ctk.CTk):
                 paste_layer(scene, img, px(x) - m, px(y) - m)
                 if not selected:
                     self.canvas.itemconfigure(self.t_tabs[key], fill="#CFCFCF" if hovered else TEXT_MID)
-                if key == "about" and self.update_state == "available":  # a new version is out
+                if key == "about" and self.update_state in ("available", "ready"):  # a new version is out
                     r, cx, cy = px(3.5), px(x + w - 13), px(y + 11)
                     ImageDraw.Draw(scene).ellipse((cx - r, cy - r, cx + r, cy + r), fill=STARLIGHT)
             if self.tab == "boost":
@@ -6729,10 +6970,11 @@ class OptimizerApp(ctk.CTk):
                     paste_layer(scene, img, px(x + w - 20 - tw), px(y + (h - th) / 2))
                 self._render_ghost(scene, "privall", L_PRIV_ALL)
             elif self.tab == "about":
-                if self.update_state == "available":
+                if self.update_state in ("available", "ready"):
                     self._render_primary(scene, "update", L_ABOUT_UPDATE)
                 else:
                     self._render_ghost(scene, "update", L_ABOUT_UPDATE)
+                self._render_ghost(scene, "report", L_ABOUT_REPORT)
                 self._render_ghost(scene, "profile", L_ABOUT_PROFILE)
                 self.canvas.itemconfigure(self.t_about_link,
                                           fill=TEXT_HI if self.hover == "btn:profile" else SILVER)
@@ -7114,6 +7356,8 @@ class OptimizerApp(ctk.CTk):
         elif self.tab == "about":
             if inside(L_ABOUT_UPDATE):
                 return "btn:update"
+            if inside(L_ABOUT_REPORT):
+                return "btn:report"
             if inside(L_ABOUT_PROFILE) or inside(L_ABOUT_LINK):
                 return "btn:profile"
         elif self.tab == "appearance":
@@ -7313,9 +7557,16 @@ class OptimizerApp(ctk.CTk):
             self._import_backup()
         elif target == "btn:profile":
             self._open_link(CREDIT_URL)
+        elif target == "btn:report":
+            self._report_problem()
         elif target == "btn:update":
-            if self.update_state == "available" and self.update_info:
-                self._open_link(self.update_info["url"])
+            if self.update_state == "ready":
+                self._confirm_update_restart()
+            elif self.update_state == "available" and self.update_info:
+                if self._can_self_update():
+                    self._start_update_download()
+                else:
+                    self._open_link(self.update_info["url"])
             else:
                 self._check_updates(manual=True)
         elif target == "btn:protect":
@@ -7855,6 +8106,14 @@ class OptimizerApp(ctk.CTk):
                     self._render()
                 elif kind == "update":
                     self._on_update_result(*event[1:])
+                elif kind == "update-progress":
+                    if self.update_state == "downloading":
+                        self.update_progress = event[1]
+                        self._refresh_update_ui()
+                elif kind == "update-downloaded":
+                    self._on_update_downloaded(*event[1:])
+                elif kind == "report":
+                    self._on_report(*event[1:])
                 elif kind == "checkup":
                     self._on_checkup(event[1])
                 elif kind == "privacy":
@@ -8109,6 +8368,9 @@ class OptimizerApp(ctk.CTk):
             self._quit()
         elif action == "overlay":
             self._toggle_overlay()
+        elif action == "report":
+            self._show_window()
+            self._report_problem()
         elif action.startswith("profile:"):
             self._select_profile(action.partition(":")[2])
 
@@ -8225,18 +8487,25 @@ class OptimizerApp(ctk.CTk):
         base = f"Version {DISPLAY_VERSION[1:]}  ·  for Windows 10 and 11"
         status = {"checking": "Checking for updates…", "current": "Up to date",
                   "failed": "Couldn't reach GitHub"}.get(self.update_state)
-        if self.update_state == "available" and self.update_info:
-            status = f"{display_tag(self.update_info['tag'])} is available"
+        if self.update_info and self.update_state in ("available", "downloading", "ready"):
+            tag = display_tag(self.update_info["tag"])
+            status = {"available": f"{tag} is available", "downloading": f"Downloading {tag}…",
+                      "ready": f"{tag} is ready to install"}[self.update_state]
         return f"{base}  ·  {status}" if status else base
 
     def _update_label(self) -> str:
+        if self.update_state == "downloading":
+            return f"Downloading {self.update_progress}%"
+        if self.update_state == "ready":
+            return "Restart to update"
         if self.update_state == "available" and self.update_info:
-            return f"Download {display_tag(self.update_info['tag'])}"
+            verb = "Update to" if self._can_self_update() else "Download"
+            return f"{verb} {display_tag(self.update_info['tag'])}"
         return "Checking…" if self.update_state == "checking" else "Check for updates"
 
     def _refresh_update_ui(self) -> None:
         self.canvas.itemconfigure(self.t_about_version, text=self._version_line(),
-                                  fill=TEXT_HI if self.update_state == "available" else TEXT_MID)
+                                  fill=TEXT_HI if self.update_state in ("available", "ready") else TEXT_MID)
         self.canvas.itemconfigure(self.t_buttons["update"], text=self._update_label())
         self.canvas.configure(cursor="hand2" if self._enabled(self.hover) else "")
         self._render()
@@ -8257,7 +8526,7 @@ class OptimizerApp(ctk.CTk):
         self._schedule_update_check(UPDATE_INTERVAL_MS)
 
     def _check_updates(self, manual: bool) -> None:
-        if self.update_state == "checking":
+        if self.update_state in ("checking", "downloading", "ready"):
             return
         previous = self.update_state
         self.update_state = "checking"
@@ -8282,13 +8551,138 @@ class OptimizerApp(ctk.CTk):
                             and self.update_info["tag"] == release["tag"])
             self.update_state, self.update_info = "available", release
             if announce or manual:
-                self._emit("info", f"{APP_NAME} {display_tag(release['tag'])} is available. "
-                                   "Download it from the About tab.")
+                how = "Update from the About tab" if self._can_self_update() else "Download it from the About tab"
+                self._emit("info", f"{APP_NAME} {display_tag(release['tag'])} is available. {how}.")
         else:
             self.update_state, self.update_info = "current", None
             if manual:
                 self._emit("ok", f"{APP_NAME} {DISPLAY_VERSION} is the latest version")
         self._refresh_update_ui()
+
+    def _can_self_update(self) -> bool:
+        return (bool(getattr(sys, "frozen", False)) and sys.executable.lower().endswith(".exe")
+                and bool(self.update_info and self.update_info.get("download")))
+
+    def _start_update_download(self) -> None:
+        info = self.update_info
+        self.update_state, self.update_progress = "downloading", 0
+        self._refresh_update_ui()
+        self._emit("info", f"Downloading {APP_NAME} {display_tag(info['tag'])}…")
+        dest = sys.executable + ".download"
+
+        def work() -> None:
+            try:
+                download_update(info, dest, progress=lambda pct: self.events.put(("update-progress", pct)))
+                self.events.put(("update-downloaded", dest, None))
+            except Exception as exc:
+                self.events.put(("update-downloaded", None, str(exc) or type(exc).__name__))
+
+        threading.Thread(target=work, name="update-download", daemon=True).start()
+
+    def _on_update_downloaded(self, path: str | None, error: str | None) -> None:
+        if error is not None or not path:
+            self.update_state = "available"
+            self._emit("warn", f"Update not downloaded: {error}. Nothing was changed - try again, or get it from "
+                               "the release page.")
+            self._refresh_update_ui()
+            return
+        self.update_state, self.update_file = "ready", path
+        self._emit("ok", f"{display_tag(self.update_info['tag'])} downloaded and checked")
+        self._refresh_update_ui()
+        self._confirm_update_restart()
+
+    def _confirm_update_restart(self) -> None:
+        if self.dialog:
+            return
+        if self.busy:
+            self._emit("info", "Restart to update once the running job has finished")
+            return
+        tag = display_tag(self.update_info["tag"]) if self.update_info else "The update"
+        self._open_dialog(f"{tag} is ready",
+                          f"{APP_NAME} closes and opens again as {tag}. Your settings, games and any mode you "
+                          "applied stay as they are.",
+                          "Restart now", self._install_update, cancel_label="Later")
+
+    def _install_update(self) -> None:
+        if self.busy or not self.update_file:
+            return
+        exe = sys.executable
+        try:
+            install_update(exe, self.update_file)
+        except OSError as exc:
+            self.update_state, self.update_file = "available", None
+            self._emit("fail", f"Couldn't install the update: {exc}")
+            self._refresh_update_ui()
+            return
+        try:
+            launch_updated(exe)
+        except OSError as exc:
+            self._emit("warn", f"Updated, but couldn't restart ({exc}). Open {APP_NAME} again to use the new version.")
+            self.update_state, self.update_file = "current", None
+            self._refresh_update_ui()
+            return
+        self._shutdown()
+
+    # ---------------- problem report ----------------
+
+    def _report_problem(self) -> None:
+        if self.report_busy:
+            return
+        self.report_busy = True
+        self.canvas.itemconfigure(self.t_buttons["report"], text="Making report…")
+        self.canvas.configure(cursor="hand2" if self._enabled(self.hover) else "")
+        self._render()
+        if self.tray is not None:
+            self.tray.refresh()
+        self._emit("info", "Making a problem report - this runs a checkup and takes a few seconds…")
+        applied = self.state_store.get("applied_profile")
+        app_info = {
+            "Version": DISPLAY_VERSION + ("" if getattr(sys, "frozen", False) else " (from source)"),
+            "Administrator": "yes" if self.admin else "no (monitor-only)",
+            "Applied mode": PROFILE_TITLES.get(applied, "none") if self.undo_count else "none",
+            "Changes to undo": self.undo_count,
+            "Games in list": len(self.games),
+            "Display scale": f"{self.scale:.2f}",
+            "Overlay": "on" if self.overlay_visible() else "off",
+        }
+        sessions = list(self._setting("sessions") or [])[-5:]
+        games = [dict(g) for g in self.games]
+        stamp = _dt.datetime.now().strftime("%Y-%m-%d %H%M")
+        path = os.path.join(desktop_folder(), f"Astra Optimizer report {stamp}.zip")
+        state_file = self.state_store.path
+
+        def work() -> None:
+            try:
+                write_problem_report(path, app_info, games, sessions, state_file)
+                self.events.put(("report", path, None))
+            except Exception as exc:
+                self.events.put(("report", None, str(exc) or type(exc).__name__))
+
+        threading.Thread(target=work, name="report", daemon=True).start()
+
+    def _on_report(self, path: str | None, error: str | None) -> None:
+        self.report_busy = False
+        self.canvas.itemconfigure(self.t_buttons["report"], text="Report a problem")
+        self.canvas.configure(cursor="hand2" if self._enabled(self.hover) else "")
+        if self.tray is not None:
+            self.tray.refresh()
+        if error is not None or not path:
+            self._emit("fail", f"Couldn't make the report: {error}")
+            self._render()
+            return
+        name = os.path.basename(path)
+        self._emit("ok", f"Report saved to your desktop: {name}")
+        try:
+            subprocess.Popen(f'explorer.exe /select,"{path}"', creationflags=CREATE_NO_WINDOW)
+        except OSError:
+            pass
+        self._render()
+        if not self.dialog:
+            self._open_dialog("Report saved",
+                              f"{name} is on your desktop. Send it to {CREDIT_NAME} with a line or two about what "
+                              "went wrong.\n\nIt holds your PC specs, a checkup, your last game sessions and "
+                              f"{APP_NAME}'s log and settings - no personal files.",
+                              "Done", lambda: None, cancel_label=None, width=440)
 
     # ---------------- settings backup ----------------
 
@@ -9979,8 +10373,14 @@ def main() -> None:
             ctypes.windll.shell32.SHChangeNotify(0x00002000, 0x0005 | 0x2000, ctypes.c_wchar_p(sys.executable), None)
         except (AttributeError, OSError):
             pass  # SHCNE_UPDATEITEM, SHCNF_PATHW | SHCNF_FLUSHNOWAIT
+    updated = "--updated" in args
+    if updated:
+        wait_for_previous_instance()  # the version this replaced is closing right now
     if signal_running_instance():
         return  # already running (maybe in the tray): it shows itself
+    if getattr(sys, "frozen", False):
+        threading.Thread(target=remove_update_leftovers, args=(sys.executable,), name="update-cleanup",
+                         daemon=True).start()
     admin = is_admin()
     if not admin and not no_elevate:
         if relaunch_as_admin():
@@ -9996,6 +10396,8 @@ def main() -> None:
         )
         root.destroy()
     app = OptimizerApp(admin=admin, start_hidden="--tray" in args, instance_event=create_instance_event())
+    if updated:
+        app.after(1200, lambda: app._emit("ok", f"Updated to {APP_NAME} {DISPLAY_VERSION}"))
     app.mainloop()
 
 

@@ -4,6 +4,21 @@ What changed in each version of Astra Optimizer. The newest version is at the to
 
 When a version is tagged on GitHub (for example `v1.2.0`), its section below becomes the release notes.
 
+## v1.4.0 - 2026-11-15
+
+### Added
+- **In-app updates:** when a new version is out, **Update to vN.N.N** on the About tab downloads it from this
+  project's GitHub release, checks it against the SHA-256 checksum in the release notes, and restarts Astra on the new
+  version. Settings, games and any applied mode carry over, and the old exe is cleaned up after the restart. A
+  download that doesn't match its checksum is thrown away and nothing changes. Choose **Later** to finish the update
+  whenever you like.
+- **Report a problem:** one button on the About tab (also in the tray menu) saves a zip to your desktop with your PC
+  specs, a fresh checkup, your last five game sessions and the app's log and settings, then shows it in Explorer
+  ready to send.
+
+### Changed
+- The About tab links to the project's GitHub page.
+
 ## v1.3.0 - 2026-11-15
 
 ### Added
