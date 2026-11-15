@@ -9972,6 +9972,13 @@ def main() -> None:
         ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID(APP_USER_MODEL_ID)
     except (AttributeError, OSError):
         pass
+    if getattr(sys, "frozen", False):
+        # Tell the Shell this exe may have changed, so its cached icon is refreshed. Taskbars that ask
+        # the Shell for the 256 px icon (Seelen UI does) otherwise keep showing an older build's icon.
+        try:
+            ctypes.windll.shell32.SHChangeNotify(0x00002000, 0x0005 | 0x2000, ctypes.c_wchar_p(sys.executable), None)
+        except (AttributeError, OSError):
+            pass  # SHCNE_UPDATEITEM, SHCNF_PATHW | SHCNF_FLUSHNOWAIT
     if signal_running_instance():
         return  # already running (maybe in the tray): it shows itself
     admin = is_admin()

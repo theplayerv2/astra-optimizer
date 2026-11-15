@@ -29,6 +29,8 @@ When a version is tagged on GitHub (for example `v1.2.0`), its section below bec
 ### Fixed
 - The taskbar showed a generic icon instead of Astra's; the window now carries its own icon and Windows groups
   and pins it as Astra Optimizer.
+- Taskbars that read Windows' cached 256 px icon (such as Seelen UI) could keep showing an old build's icon; Astra
+  now asks Windows to refresh its cached icon when it starts.
 
 ## v1.2.0 - 2026-11-15
 
