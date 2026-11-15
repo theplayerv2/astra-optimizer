@@ -4,7 +4,7 @@ What changed in each version of Astra Optimizer. The newest version is at the to
 
 When a version is tagged on GitHub (for example `v1.2.0`), its section below becomes the release notes.
 
-## v1.3.0 - Unreleased
+## v1.3.0 - 2026-11-15
 
 ### Added
 - **FPS measurement:** while a game from your list runs, Astra records its frame rate with Intel PresentMon (bundled,
