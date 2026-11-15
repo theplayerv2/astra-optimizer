@@ -1,7 +1,7 @@
 """Release helper used by .github/workflows/release.yml.
 
-    python tools/release_notes.py v1.2 release-notes.md
-    python tools/release_notes.py v1.2 release-notes.md --checksum dist/SHA256.txt
+    python tools/release_notes.py v1.2.0 release-notes.md
+    python tools/release_notes.py v1.2.0 release-notes.md --checksum dist/SHA256.txt
 
 Checks that the tag matches DISPLAY_VERSION in optimizer.py (so a release can't ship with the
 wrong version inside), then writes that version's CHANGELOG.md section as the release notes.
@@ -42,7 +42,11 @@ def main(argv: list[str]) -> int:
     checksum = None
     if "--checksum" in argv:
         checksum = pathlib.Path(argv[argv.index("--checksum") + 1]).read_text(encoding="utf-8").strip()
+    if not re.fullmatch(r"v\d+\.\d+\.\d+", tag):
+        raise SystemExit(f"Tag {tag} isn't in vN.N.N format (for example v1.2.0).")
     version = app_version()
+    if not re.fullmatch(r"v\d+\.\d+\.\d+", version):
+        raise SystemExit(f"DISPLAY_VERSION {version} in optimizer.py isn't in vN.N.N format (for example v1.2.0).")
     if tag != version:
         raise SystemExit(f"Tag {tag} doesn't match DISPLAY_VERSION {version} in optimizer.py. "
                          "Update the version in optimizer.py, commit, and tag again.")

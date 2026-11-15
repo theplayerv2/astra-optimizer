@@ -2,13 +2,13 @@
 
 What changed in each version of Astra Optimizer. The newest version is at the top.
 
-When a version is tagged on GitHub (for example `v1.2`), its section below becomes the release notes.
+When a version is tagged on GitHub (for example `v1.2.0`), its section below becomes the release notes.
 
 ## Unreleased
 
 Nothing yet.
 
-## v1.2 - 2026-11-15
+## v1.2.0 - 2026-11-15
 
 ### Added
 - **Privacy tab** with six switches for ads and tracking built into Windows: ads and suggested apps in Start and
@@ -37,7 +37,7 @@ Nothing yet.
 - Settings' last row is now "Your data", with Back up, Restore and Open folder.
 - Up to 100 game sessions are kept (was 40).
 
-## v1.1 - 2026-11-15
+## v1.1.0 - 2026-11-15
 
 ### Added
 - **Gaming checkup** on the Tools tab: refresh rate below the monitor's maximum (one-click fix), RAM below its rated
@@ -55,7 +55,7 @@ Nothing yet.
   Download button when one exists. It only checks; nothing downloads or installs on its own. It can be turned off in
   Settings.
 
-## v1 - 2026-11-15
+## v1.0.0 - 2026-11-15
 
 First public release.
 

@@ -100,13 +100,13 @@ python -m venv .venv
 
 ### Making a release
 
-1. Set `APP_VERSION` and `DISPLAY_VERSION` at the top of `optimizer.py` (for example `1.3.0` and `v1.3`).
-2. Add a `## v1.3 - YYYY-MM-DD` section to `CHANGELOG.md`.
+1. Set `APP_VERSION` and `DISPLAY_VERSION` at the top of `optimizer.py` (for example `1.3.0` and `v1.3.0`).
+2. Add a `## v1.3.0 - YYYY-MM-DD` section to `CHANGELOG.md`.
 3. Commit, then tag and push:
 
    ```bat
-   git tag v1.3
-   git push origin main v1.3
+   git tag v1.3.0
+   git push origin main v1.3.0
    ```
 
 GitHub Actions builds the exe on a clean Windows machine and publishes the release with the changelog

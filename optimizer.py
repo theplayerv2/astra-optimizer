@@ -57,7 +57,7 @@ except Exception:  # pragma: no cover - depends on the build
 APP_NAME = "Astra Optimizer"
 LEGACY_APP_NAME = "Optimizer"  # pre-1.12 name: data folder and startup task are carried over
 APP_VERSION = "1.2.0"
-DISPLAY_VERSION = "v1.2"
+DISPLAY_VERSION = "v1.2.0"
 CREDIT_NAME = "theplayerv2"
 CREDIT_URL = "https://guns.lol/playerv2"
 UPDATE_REPO = "theplayerv2/astra-optimizer"
