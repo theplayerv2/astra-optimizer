@@ -24,8 +24,8 @@ returns your PC to exactly how *you* had it, not to Windows defaults.
 
 | Mode | What changes |
 |---|---|
-| **Max FPS** | Ultimate Performance power plan, visual effects set for performance (ClearType stays on), Game Bar capture off and Game Mode on, optimizations for windowed games and variable refresh rate on, NVIDIA power management at Prefer maximum performance and Low Latency Mode on, DNS cache flushed, background services paused until restart (SysMain, telemetry, Search indexer and a few others), and a deep RAM cleanup |
-| **Cozy Mode** | High Performance power plan, a gentle RAM cleanup that leaves Discord, Spotify, browsers and the window in front alone, GPU scheduling on, optimizations for windowed games and variable refresh rate on, NVIDIA Low Latency Mode on, smooth animations |
+| **Max FPS** | Ultimate Performance power plan, visual effects set for performance (ClearType stays on), Game Bar capture off and Game Mode on, optimizations for windowed games and variable refresh rate on, NVIDIA power management at Prefer maximum performance and Low Latency Mode on (AMD: Anti-Lag on, Radeon Chill off), DNS cache flushed, background services paused until restart (SysMain, telemetry, Search indexer and a few others), and a deep RAM cleanup |
+| **Cozy Mode** | High Performance power plan, a gentle RAM cleanup that leaves Discord, Spotify, browsers and the window in front alone, GPU scheduling on, optimizations for windowed games and variable refresh rate on, NVIDIA Low Latency Mode on (AMD: Anti-Lag on), smooth animations |
 | **Best Looking** | Full visual effects with transparency and ClearType, Search and SysMain running again, Game Bar back to its defaults (Balanced power plan on laptops running on battery) |
 
 Before anything runs you see a preview of what will change on *your* PC, and afterwards a short summary.
@@ -50,7 +50,7 @@ Six switches for ads and tracking built into Windows: ads and suggested apps in 
 - Starfield, plain black or your own picture as the background, with blur, dim, panel opacity and frost.
 - Motion: follow Windows, Full, Reduced or Off.
 - Keep running in the tray, start with Windows (elevated, no UAC prompt), a global hotkey (**Ctrl+Alt+O**) to toggle your mode in-game, an optional System Restore point before your first optimize each day, a check for new versions, and **Back up / Restore** to move your settings, games, appearance and session history to another PC in one file.
-- **Report a problem** (About tab or tray menu) saves one zip to your desktop with your PC specs, a fresh checkup, your last game sessions and the app's log and settings, ready to send with a bug report.
+- **Report a problem** (About tab or tray menu) saves one zip to your desktop with your PC specs, a fresh checkup, your last game sessions and the app's log and settings, ready to send with a bug report. If something unexpected goes wrong, Astra logs the details and offers this report straight away.
 
 | | |
 |---|---|

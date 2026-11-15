@@ -4,6 +4,20 @@ What changed in each version of Astra Optimizer. The newest version is at the to
 
 When a version is tagged on GitHub (for example `v1.2.0`), its section below becomes the release notes.
 
+## v1.5.0 - 2026-11-15
+
+### Added
+- **AMD driver settings:** on AMD Radeon graphics, Max FPS turns on AMD Anti-Lag and turns off Radeon Chill (which
+  caps FPS to save power); Cozy Mode turns on Anti-Lag. They go through AMD's own ADLX library, the same settings AMD
+  Software shows, and Undo puts back exactly what you had. If AMD Software has the newer in-driver Anti-Lag selected,
+  Astra leaves it alone.
+- **Crash catcher:** if something unexpected goes wrong, the full error goes into the log and a dialog offers
+  **Report a problem** straight away (once per run). If Astra can't even open, it still logs the error and offers to
+  save a report to your desktop.
+
+### Changed
+- The mode log has one "Graphics driver" section for NVIDIA and AMD, with a single line when neither is there.
+
 ## v1.4.0 - 2026-11-15
 
 ### Added

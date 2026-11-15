@@ -56,8 +56,8 @@ except Exception:  # pragma: no cover - depends on the build
 
 APP_NAME = "Astra Optimizer"
 LEGACY_APP_NAME = "Optimizer"  # pre-1.12 name: data folder and startup task are carried over
-APP_VERSION = "1.4.0"
-DISPLAY_VERSION = "v1.4.0"
+APP_VERSION = "1.5.0"
+DISPLAY_VERSION = "v1.5.0"
 CREDIT_NAME = "theplayerv2"
 UPDATE_REPO = "theplayerv2/astra-optimizer"
 CREDIT_URL = f"https://github.com/{UPDATE_REPO}"
@@ -1071,6 +1071,196 @@ class NvidiaDrs:
         self._call("DRS_SaveSettings", self.session)
 
 
+# --------------------------------------------------------------------------------------
+# AMD driver settings through ADLX (amdadlx64.dll, installed with AMD Software). ADLX is a C
+# interface: every object is a pointer to a table of functions, and the slot numbers below are
+# the order of those tables in AMD's public headers (github.com/GPUOpen-LibrariesAndSDKs/ADLX:
+# ISystem.h, I3DSettings.h). Only settings that exist in every ADLX version are used.
+# --------------------------------------------------------------------------------------
+
+ADLX_OK, ADLX_ALREADY_ENABLED, ADLX_NOT_SUPPORTED = 0, 1, 12
+ADLX_NO_DRIVER = -1                    # our own code: amdadlx64.dll isn't there (no AMD graphics driver)
+ADLX_ANTILAG_PLAIN = 0                 # ADLX_ANTILAG_STATE: 0 = Anti-Lag, 1 = the newer in-driver variant
+# slots: IADLXSystem has no Acquire/Release; every other interface starts with Acquire, Release, QueryInterface
+ADLX_SYS_GET_GPUS, ADLX_SYS_GET_3D = 1, 7
+ADLX_RELEASE, ADLX_QUERY_INTERFACE = 1, 2
+ADLX_LIST_SIZE, ADLX_LIST_BEGIN, ADLX_LIST_AT_GPU = 3, 5, 11
+ADLX_GPU_NAME, ADLX_GPU_UNIQUE_ID = 7, 18
+ADLX_3D_GET_ANTILAG, ADLX_3D_GET_CHILL = 3, 4
+ADLX_FEATURE_IS_SUPPORTED, ADLX_FEATURE_IS_ENABLED = 3, 4
+ADLX_SET_ENABLED = {"antilag": 5, "chill": 8}
+ADLX_ANTILAG1_GET_LEVEL = 6
+AMD_TWEAKS = {
+    "max": [("antilag", True, "AMD Anti-Lag", "On"), ("chill", False, "AMD Radeon Chill", "Off")],
+    "cozy": [("antilag", True, "AMD Anti-Lag", "On")],
+}
+
+
+class AmdError(Exception):
+    def __init__(self, what: str, code: int):
+        reason = {ADLX_NO_DRIVER: "no AMD graphics driver", ADLX_NOT_SUPPORTED: "not supported"}.get(
+            code, f"ADLX error {code}")
+        super().__init__(f"{what}: {reason}")
+        self.code = code
+
+
+def _adlx_call(obj, slot: int, restype, argtypes: list, *args):
+    """Call slot `slot` of an ADLX object's function table."""
+    table = ctypes.cast(obj, ctypes.POINTER(ctypes.POINTER(ctypes.c_void_p)))[0]
+    function = ctypes.WINFUNCTYPE(restype, ctypes.c_void_p, *argtypes)(table[slot])
+    return function(obj, *args)
+
+
+class AmdAdlx:
+    """One ADLX session listing the AMD GPUs. Use as a context manager."""
+
+    _dll = None
+
+    @classmethod
+    def _load(cls):
+        if cls._dll is None:
+            try:
+                dll = ctypes.CDLL("amdadlx64.dll")
+            except OSError as exc:
+                raise AmdError("AMD driver", ADLX_NO_DRIVER) from exc
+            dll.ADLXQueryFullVersion.restype = ctypes.c_int
+            dll.ADLXQueryFullVersion.argtypes = [ctypes.POINTER(ctypes.c_uint64)]
+            dll.ADLXInitialize.restype = ctypes.c_int
+            dll.ADLXInitialize.argtypes = [ctypes.c_uint64, ctypes.POINTER(ctypes.c_void_p)]
+            dll.ADLXTerminate.restype = ctypes.c_int
+            dll.ADLXTerminate.argtypes = []
+            cls._dll = dll
+        return cls._dll
+
+    def __init__(self):
+        self.dll = self._load()
+        self.system = ctypes.c_void_p()
+        self._held: list = []
+        self.services = None
+        self.gpus: list = []
+
+    def _check(self, what: str, rc: int) -> None:
+        if rc not in (ADLX_OK, ADLX_ALREADY_ENABLED):
+            raise AmdError(what, rc)
+
+    def _get(self, what: str, obj, slot: int, in_types: tuple = (), *in_args, keep: bool = True):
+        """Call a getter that returns an interface through its last argument."""
+        out = ctypes.c_void_p()
+        rc = _adlx_call(obj, slot, ctypes.c_int, [*in_types, ctypes.POINTER(ctypes.c_void_p)],
+                        *in_args, ctypes.pointer(out))
+        self._check(what, rc)
+        if not out.value:
+            raise AmdError(what, ADLX_NOT_SUPPORTED)
+        if keep:
+            self._held.append(out)
+        return out
+
+    def _release(self, obj) -> None:
+        try:
+            _adlx_call(obj, ADLX_RELEASE, ctypes.c_long, [])
+        except Exception:
+            pass
+
+    def __enter__(self) -> "AmdAdlx":
+        version = ctypes.c_uint64()
+        # Ask for the version the installed driver has: everything used here exists since ADLX 1.0.
+        self._check("ADLX version", self.dll.ADLXQueryFullVersion(ctypes.pointer(version)))
+        self._check("AMD driver", self.dll.ADLXInitialize(version.value, ctypes.pointer(self.system)))
+        if not self.system.value:
+            self.dll.ADLXTerminate()
+            raise AmdError("AMD driver", ADLX_NO_DRIVER)
+        try:
+            self.services = self._get("3D settings", self.system, ADLX_SYS_GET_3D)
+            gpu_list = self._get("GPU list", self.system, ADLX_SYS_GET_GPUS)
+            size = _adlx_call(gpu_list, ADLX_LIST_SIZE, ctypes.c_uint, [])
+            begin = _adlx_call(gpu_list, ADLX_LIST_BEGIN, ctypes.c_uint, [])
+            self.gpus = [self._get("GPU", gpu_list, ADLX_LIST_AT_GPU, (ctypes.c_uint,), begin + i)
+                         for i in range(size)]
+        except BaseException:
+            self.__exit__()
+            raise
+        return self
+
+    def __exit__(self, *exc) -> None:
+        for obj in reversed(self._held):
+            self._release(obj)
+        self._held.clear()
+        if self.system.value:
+            self.dll.ADLXTerminate()
+            self.system = ctypes.c_void_p()
+
+    def gpu_name(self, gpu) -> str:
+        name = ctypes.c_char_p()
+        _adlx_call(gpu, ADLX_GPU_NAME, ctypes.c_int, [ctypes.POINTER(ctypes.c_char_p)], ctypes.pointer(name))
+        return (name.value or b"AMD GPU").decode("utf-8", "replace")
+
+    def gpu_id(self, gpu) -> int:
+        unique = ctypes.c_int()
+        _adlx_call(gpu, ADLX_GPU_UNIQUE_ID, ctypes.c_int, [ctypes.POINTER(ctypes.c_int)], ctypes.pointer(unique))
+        return int(unique.value)
+
+    def _feature(self, gpu, feature: str):
+        slot = {"antilag": ADLX_3D_GET_ANTILAG, "chill": ADLX_3D_GET_CHILL}[feature]
+        return self._get(feature, self.services, slot, (ctypes.c_void_p,), gpu)
+
+    def get(self, gpu, feature: str) -> bool | None:
+        """On/off, or None when this GPU doesn't have the feature."""
+        try:
+            obj = self._feature(gpu, feature)
+        except AmdError as exc:
+            if exc.code == ADLX_NOT_SUPPORTED:
+                return None
+            raise
+        flag = ctypes.c_bool()
+        rc = _adlx_call(obj, ADLX_FEATURE_IS_SUPPORTED, ctypes.c_int, [ctypes.POINTER(ctypes.c_bool)],
+                        ctypes.pointer(flag))
+        if rc != ADLX_OK or not flag.value:
+            return None
+        self._check(feature, _adlx_call(obj, ADLX_FEATURE_IS_ENABLED, ctypes.c_int,
+                                        [ctypes.POINTER(ctypes.c_bool)], ctypes.pointer(flag)))
+        return bool(flag.value)
+
+    def set(self, gpu, feature: str, value: bool) -> None:
+        obj = self._feature(gpu, feature)
+        self._check(feature, _adlx_call(obj, ADLX_SET_ENABLED[feature], ctypes.c_int, [ctypes.c_bool], bool(value)))
+
+    def antilag_level(self, gpu) -> int | None:
+        """Which Anti-Lag AMD Software has selected, on drivers that have more than one; else None."""
+        try:
+            obj = self._feature(gpu, "antilag")
+            newer = self._get("Anti-Lag level", obj, ADLX_QUERY_INTERFACE, (ctypes.c_wchar_p,), "IADLX3DAntiLag1")
+        except AmdError:
+            return None
+        level = ctypes.c_int()
+        if _adlx_call(newer, ADLX_ANTILAG1_GET_LEVEL, ctypes.c_int, [ctypes.POINTER(ctypes.c_int)],
+                      ctypes.pointer(level)) != ADLX_OK:
+            return None
+        return int(level.value)
+
+
+def amd_pending(profile: str) -> list[str]:
+    """Read-only: which AMD tweaks of a mode would change something now."""
+    wanted = AMD_TWEAKS.get(profile) or []
+    if not wanted:
+        return []
+    try:
+        with AmdAdlx() as amd:
+            out = []
+            for gpu in amd.gpus:
+                for feature, value, label, shown in wanted:
+                    current = amd.get(gpu, feature)
+                    if current is None or current == value:
+                        continue
+                    if feature == "antilag" and amd.antilag_level(gpu) not in (None, ADLX_ANTILAG_PLAIN):
+                        continue
+                    text = f"{label.replace('AMD ', '')} {shown}"
+                    if text not in out:
+                        out.append(text)
+            return out
+    except Exception:
+        return []
+
+
 def nvidia_pending(profile: str) -> list[str]:
     """Read-only: which NVIDIA tweaks of a mode would change something now."""
     wanted = NVIDIA_TWEAKS.get(profile) or []
@@ -1637,6 +1827,7 @@ class SystemTweaks:
             "spi": ("Visual effects", self._undo_spi),
             "svc": ("Services", self._undo_service),
             "nvdrs": ("NVIDIA settings", self._undo_nvidia),
+            "amd": ("AMD settings", self._undo_amd),
         }
         for kind, (title, handler) in handlers.items():
             group = [(key, entry) for key, entry in items if entry.get("kind") == kind]
@@ -1733,6 +1924,9 @@ class SystemTweaks:
             nv = nvidia_pending("max")
             if nv:
                 lines.append("NVIDIA: " + ", ".join(nv))
+            amd = amd_pending("max")
+            if amd:
+                lines.append("AMD: " + ", ".join(amd))
             lines.append("Flush the DNS cache")
         elif profile == "cozy":
             power("High Performance", "high performance")
@@ -1747,6 +1941,9 @@ class SystemTweaks:
             nv = nvidia_pending("cozy")
             if nv:
                 lines.append("NVIDIA: " + ", ".join(nv))
+            amd = amd_pending("cozy")
+            if amd:
+                lines.append("AMD: " + ", ".join(amd))
         else:
             if has_battery():
                 power("Balanced (battery detected)", "balanced")
@@ -1764,7 +1961,13 @@ class SystemTweaks:
 
     # ---------------- profiles ----------------
 
-    def apply_nvidia(self, profile: str) -> None:
+    def apply_gpu_driver(self, profile: str) -> None:
+        found = [self.apply_nvidia(profile, quiet=True), self.apply_amd(profile)]
+        if not any(found):
+            self.log.info("No NVIDIA or AMD graphics card - driver settings skipped")
+
+    def apply_nvidia(self, profile: str, quiet: bool = False) -> bool:
+        """True when an NVIDIA card was there to talk to."""
         wanted = NVIDIA_TWEAKS.get(profile) or []
         try:
             with NvidiaDrs() as nv:
@@ -1785,11 +1988,61 @@ class SystemTweaks:
                     nv.save()
         except NvidiaError as exc:
             if exc.code == NV_DEVICE_NOT_FOUND:
-                self.log.info("No NVIDIA graphics card - driver settings skipped")
-            else:
-                self.log.warn(f"NVIDIA settings not changed: {exc}")
+                if not quiet:
+                    self.log.info("No NVIDIA graphics card - driver settings skipped")
+                return False
+            self.log.warn(f"NVIDIA settings not changed: {exc}")
         except Exception as exc:  # never let a driver call break the rest of the mode
             self.log.warn(f"NVIDIA settings not changed: {exc.__class__.__name__}: {exc}")
+        return True
+
+    def apply_amd(self, profile: str) -> bool:
+        """AMD Anti-Lag / Radeon Chill on every AMD GPU that has them. True when AMD's driver was there."""
+        wanted = AMD_TWEAKS.get(profile) or []
+        try:
+            with AmdAdlx() as amd:
+                if not amd.gpus:
+                    return False
+                several = len(amd.gpus) > 1
+                for gpu in amd.gpus:
+                    gid, name = amd.gpu_id(gpu), amd.gpu_name(gpu)
+                    where = f" ({name})" if several else ""
+                    for feature, value, label, shown in wanted:
+                        current = amd.get(gpu, feature)
+                        if current is None:
+                            continue  # this GPU doesn't have it
+                        if feature == "antilag" and value and amd.antilag_level(gpu) not in (None, ADLX_ANTILAG_PLAIN):
+                            # Never switch on the newer in-driver variant: Anti-Lag+ got CS2 players banned in 2023.
+                            self.log.info(f"{label}{where}: AMD Software has a newer Anti-Lag selected - left as it is")
+                            continue
+                        if current == value:
+                            self.log.ok(f"{label}{where}: already {shown}")
+                            continue
+                        key = f"amd:{feature}:{gid}"
+                        if self.recording and not self.state.snapshot_has(key):
+                            self.state.snapshot_add(key, {"kind": "amd", "feature": feature, "gpu": gid,
+                                                          "label": label, "value": current})
+                        amd.set(gpu, feature, value)
+                        self.stats["changed"] += 1
+                        self.log.ok(f"{label}{where}: {shown}")
+        except AmdError as exc:
+            if exc.code == ADLX_NO_DRIVER:
+                return False
+            self.log.warn(f"AMD settings not changed: {exc}")
+        except Exception as exc:  # never let a driver call break the rest of the mode
+            self.log.warn(f"AMD settings not changed: {exc.__class__.__name__}: {exc}")
+        return True
+
+    def _undo_amd(self, entry: dict) -> bool:
+        label = entry.get("label", "AMD setting")
+        with AmdAdlx() as amd:
+            gpu = next((g for g in amd.gpus if amd.gpu_id(g) == int(entry["gpu"])), None)
+            if gpu is None:
+                self.log.warn(f"{label}: that graphics card isn't there any more - nothing to put back")
+                return True
+            amd.set(gpu, entry["feature"], bool(entry["value"]))
+        self.log.ok(f"{label}: restored ({'on' if entry['value'] else 'off'})")
+        return True
 
     def _undo_nvidia(self, entry: dict) -> bool:
         with NvidiaDrs() as nv:
@@ -1820,8 +2073,8 @@ class SystemTweaks:
         self.apply_reg_table(GAME_MODE_ON)
         self.log.head("Windowed games")
         self.apply_windowed_games()
-        self.log.head("NVIDIA driver")
-        self.apply_nvidia("max")
+        self.log.head("Graphics driver")
+        self.apply_gpu_driver("max")
         self.log.head("Network")
         self.flush_dns()
         self.log.head("Background services (suspended until reboot)")
@@ -1841,8 +2094,8 @@ class SystemTweaks:
         self.apply_reg_table(GAME_MODE_ON)
         self.log.head("Windowed games")
         self.apply_windowed_games()
-        self.log.head("NVIDIA driver")
-        self.apply_nvidia("cozy")
+        self.log.head("Graphics driver")
+        self.apply_gpu_driver("cozy")
 
     def profile_quality(self) -> None:
         self.log.head("Power")
@@ -2356,6 +2609,21 @@ def remove_update_leftovers(exe: str, attempts: int = 40) -> None:
 # --------------------------------------------------------------------------------------
 # Problem reports: one zip with what's needed to understand a bug report from someone else's PC.
 # --------------------------------------------------------------------------------------
+
+
+def write_crash_log(text: str) -> None:
+    """Append a crash traceback to the log, even before (or after) the window exists."""
+    try:
+        os.makedirs(STATE_DIR, exist_ok=True)
+        with open(LOG_FILE, "a", encoding="utf-8") as fh:
+            fh.write(f"{_dt.datetime.now():%Y-%m-%d %H:%M:%S} [CRASH] {APP_NAME} {DISPLAY_VERSION}\n{text.rstrip()}\n")
+    except OSError:
+        pass
+
+
+def crash_summary(exc_type, exc) -> str:
+    text = f"{getattr(exc_type, '__name__', 'Error')}: {exc}" if str(exc) else getattr(exc_type, "__name__", "Error")
+    return text if len(text) <= 160 else text[:157] + "…"
 
 
 def desktop_folder() -> str:
@@ -5597,6 +5865,9 @@ class OptimizerApp(ctk.CTk):
         self.update_progress = 0
         self.update_file: str | None = None
         self.report_busy = False
+        self._crash_dialog_shown = False
+        self.report_callback_exception = self._on_tk_error
+        threading.excepthook = self._on_thread_error
         self._update_job = None
         self._backdrop_job = None
         self._slider_drag: str | None = None
@@ -8049,8 +8320,9 @@ class OptimizerApp(ctk.CTk):
         try:
             action(tweaks)
         except Exception as exc:
-            log.fail(f"Unexpected error: {exc.__class__.__name__}: {exc}")
-            self._write_log_file("TRACE", traceback.format_exc())
+            log.fail(f"Unexpected error: {exc.__class__.__name__}: {exc}. Report a problem on the About tab "
+                     "sends the details.")
+            write_crash_log(f"in {title}:\n{traceback.format_exc()}")
         finally:
             elapsed = time.monotonic() - started
             self._emit(
@@ -8114,6 +8386,8 @@ class OptimizerApp(ctk.CTk):
                     self._on_update_downloaded(*event[1:])
                 elif kind == "report":
                     self._on_report(*event[1:])
+                elif kind == "crash":
+                    self._on_crash(event[1])
                 elif kind == "checkup":
                     self._on_checkup(event[1])
                 elif kind == "privacy":
@@ -8622,6 +8896,40 @@ class OptimizerApp(ctk.CTk):
             self._refresh_update_ui()
             return
         self._shutdown()
+
+    # ---------------- crash catcher ----------------
+
+    def _record_crash(self, where: str, exc_type, exc, tb) -> None:
+        """Log the full traceback and tell the UI thread. Never raises."""
+        try:
+            text = "".join(traceback.format_exception(exc_type, exc, tb))
+            write_crash_log(f"in {where}:\n{text}")
+            self.events.put(("crash", crash_summary(exc_type, exc)))
+        except Exception:
+            pass
+
+    def _on_tk_error(self, exc_type, exc, tb) -> None:
+        self._record_crash("the window", exc_type, exc, tb)
+
+    def _on_thread_error(self, args) -> None:
+        if args.exc_type is SystemExit:
+            return
+        name = getattr(args.thread, "name", None) or "a background task"
+        self._record_crash(f"thread {name}", args.exc_type, args.exc_value, args.exc_traceback)
+
+    def _on_crash(self, summary: str) -> None:
+        if self._closing:
+            return
+        self._emit("fail", f"Something went wrong: {summary}. Details are in the log - Report a problem "
+                           "on the About tab sends them.")
+        if self._crash_dialog_shown or self.dialog:
+            return
+        self._crash_dialog_shown = True  # once per run, so a repeating error can't stack dialogs
+        self._show_window()
+        self._open_dialog("Something went wrong",
+                          f"{APP_NAME} hit an unexpected error ({summary}). It keeps running, but the last thing "
+                          f"you did may not have finished.\n\nA problem report lets {CREDIT_NAME} see what happened.",
+                          "Report a problem", self._report_problem, cancel_label="Not now", width=440)
 
     # ---------------- problem report ----------------
 
@@ -10395,10 +10703,46 @@ def main() -> None:
             parent=root,
         )
         root.destroy()
-    app = OptimizerApp(admin=admin, start_hidden="--tray" in args, instance_event=create_instance_event())
+    try:
+        app = OptimizerApp(admin=admin, start_hidden="--tray" in args, instance_event=create_instance_event())
+    except Exception as exc:
+        startup_crash(exc)
+        return
     if updated:
         app.after(1200, lambda: app._emit("ok", f"Updated to {APP_NAME} {DISPLAY_VERSION}"))
     app.mainloop()
+
+
+def startup_crash(exc: BaseException) -> None:
+    """The window couldn't open: log it and offer a report, with plain Windows dialogs."""
+    write_crash_log(f"at startup:\n{''.join(traceback.format_exception(type(exc), exc, exc.__traceback__))}")
+    summary = crash_summary(type(exc), exc)
+    try:
+        root = tk.Tk()
+        root.withdraw()
+    except Exception:
+        return
+    try:
+        if not messagebox.askyesno(
+                APP_NAME, f"{APP_NAME} couldn't start because of an unexpected error:\n\n{summary}\n\n"
+                          f"Save a problem report to your desktop to send to {CREDIT_NAME}?", parent=root):
+            return
+        root.config(cursor="watch")
+        root.update()
+        path = os.path.join(desktop_folder(), f"Astra Optimizer report {_dt.datetime.now():%Y-%m-%d %H%M}.zip")
+        try:
+            write_problem_report(path, {"Version": DISPLAY_VERSION, "Startup error": summary}, [], [], STATE_FILE)
+        except Exception as report_exc:
+            messagebox.showerror(APP_NAME, f"Couldn't make the report: {report_exc}\n\nThe error is in "
+                                           f"{LOG_FILE}", parent=root)
+            return
+        try:
+            subprocess.Popen(f'explorer.exe /select,"{path}"', creationflags=CREATE_NO_WINDOW)
+        except OSError:
+            pass
+        messagebox.showinfo(APP_NAME, f"Saved to your desktop:\n{os.path.basename(path)}", parent=root)
+    finally:
+        root.destroy()
 
 
 if __name__ == "__main__":
