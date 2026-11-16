@@ -500,9 +500,6 @@ SWP_NOACTIVATE = 0x0010
 SWP_SHOWWINDOW = 0x0040
 PW_RENDERFULLCONTENT = 0x00000002
 GWLP_HWNDPARENT = -8  # a top-level window's owner
-RDW_INVALIDATE, RDW_ALLCHILDREN, RDW_UPDATENOW, RDW_FRAME = 0x0001, 0x0080, 0x0100, 0x0400
-user32.RedrawWindow.argtypes = [wintypes.HWND, ctypes.c_void_p, ctypes.c_void_p, wintypes.UINT]
-user32.RedrawWindow.restype = wintypes.BOOL
 
 
 _icon_api = ctypes.WinDLL("user32")  # private function objects for the taskbar icon
@@ -4954,7 +4951,9 @@ DEFAULT_LOOK = {
 }
 # Startup intro (logical units). The mark lights up at the centre, its orbit is traced, the name
 # appears, then both fly into the title strip - landing exactly on the real glyph and name.
-INTRO_SECONDS = {"full": 1.95, "reduced": 0.95}
+INTRO_SECONDS = {"full": 2.2, "reduced": 0.95}  # timeline length, in intro seconds
+INTRO_PACE = {"full": 1.45, "reduced": 1.3}      # real seconds per intro second (about 3.2 s and 1.2 s)
+INTRO_HANDOFF = {"full": 1.67, "reduced": 0.55}  # when the real UI starts to fade in
 INTRO_MARK = (360, 196, 132)   # centre x, centre y, size
 INTRO_WORD = (296, 30)         # wordmark centre y, font size
 INTRO_ORBIT_TILT = math.radians(24)
@@ -5513,22 +5512,6 @@ class GalaxyPainter:
             layer.putalpha(mask)
             return layer
         return self._memo(("intro-glow", size), make)
-
-    def intro_spikes(self, reach: int) -> Image.Image:
-        """The long cross-shaped flare a star throws as it ignites, like the flared stars in the sky."""
-        def make() -> Image.Image:
-            g = reach * 2
-            c, w = reach, max(1.0, 1.4 * self.scale)
-            mask = Image.new("L", (g, g), 0)
-            d = ImageDraw.Draw(mask)
-            d.polygon([(0, c), (c, c - w), (g, c), (c, c + w)], fill=200)
-            d.polygon([(c, 0), (c - w, c), (c, g), (c + w, c)], fill=200)
-            halo = mask.filter(ImageFilter.GaussianBlur(max(1.0, 2.2 * self.scale)))
-            mask = ImageChops.add(mask, halo)
-            layer = Image.new("RGBA", (g, g), rgba(STARLIGHT, 0))
-            layer.putalpha(mask)
-            return layer
-        return self._memo(("intro-spikes", reach), make)
 
     def intro_word(self, text: str, size: int, tracking: float) -> Image.Image:
         """The wordmark set glyph by glyph so its letter-spacing can close up as it appears.
@@ -6307,7 +6290,9 @@ class OptimizerApp(ctk.CTk):
         self.intro: dict | None = None
         self._intro_pending = self._intro_wanted()
         if self._intro_pending:
-            self.attributes("-alpha", 0.0)  # stay invisible until the intro covers the window
+            # Never shown until the intro covers it. (No transparency tricks on the main window: shells
+            # and window managers such as Seelen UI track new windows and can mishandle invisible ones.)
+            self.withdraw()
         self.after(10, self._apply_borderless)
 
         self.telemetry = TelemetryThread(self.events)
@@ -6375,13 +6360,17 @@ class OptimizerApp(ctk.CTk):
             self.after(120, self._minimize)
 
     def _reveal(self) -> None:
+        if self._intro_pending:
+            self._intro_pending = False
+            self._start_intro()  # puts the cover up, then shows the window underneath it
+            return
+        self._show_main()
+
+    def _show_main(self) -> None:
         self.deiconify()
         self.lift()
         self.focus_force()
         self._ensure_window_size()
-        if self._intro_pending:
-            self._intro_pending = False
-            self.after(0, self._start_intro)
 
     # ---------------- startup intro ----------------
 
@@ -6392,10 +6381,9 @@ class OptimizerApp(ctk.CTk):
         """Cover the window with a borderless twin and play the intro on it. The real UI is ready
         underneath; the last frames crossfade into a snapshot of it, so the handoff is invisible."""
         px = self.px
+        shown = False
         try:
             self.update_idletasks()
-            if not self._can_fade():
-                raise RuntimeError("window not showing")
             level = self._motion_level()
             if level == "off":
                 raise RuntimeError("motion is off")
@@ -6414,34 +6402,57 @@ class OptimizerApp(ctk.CTk):
             win.update_idletasks()
             hwnd = int(win.wm_frame(), 16)
             ex = user32.GetWindowLongPtrW(hwnd, GWL_EXSTYLE)
-            user32.SetWindowLongPtrW(hwnd, GWL_EXSTYLE, ex | WS_EX_TOOLWINDOW)
+            # Never activated: the main window stays the foreground window throughout, so closing the
+            # cover can't hand activation to some other app and leave Astra behind it.
+            user32.SetWindowLongPtrW(hwnd, GWL_EXSTYLE, ex | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE)
             user32.SetWindowLongPtrW(hwnd, GWLP_HWNDPARENT, self._hwnd())  # owned: stays above, hides with it
-            user32.SetWindowPos(hwnd, None, self.winfo_rootx(), self.winfo_rooty(), size[0], size[1],
-                                SWP_SHOWWINDOW)
+            match = re.match(r"\d+x\d+([+-]-?\d+)([+-]-?\d+)", tk.Tk.wm_geometry(self))  # where it will open
+            x, y = ((int(match.group(1).replace("+", "")), int(match.group(2).replace("+", ""))) if match
+                    else (self.winfo_rootx(), self.winfo_rooty()))
+            user32.SetWindowPos(hwnd, None, x, y, size[0], size[1], SWP_SHOWWINDOW | SWP_NOACTIVATE)
             if dwmapi is not None:
                 corner = ctypes.c_int(DWMWCP_ROUND)
                 dwmapi.DwmSetWindowAttribute(hwnd, DWMWA_WINDOW_CORNER_PREFERENCE, ctypes.byref(corner), 4)
             label.update()
-            for sequence in ("<ButtonPress>", "<KeyPress>"):
-                win.bind(sequence, lambda _e: self._skip_intro())
-            win.focus_force()
+            # Now the real window, a perfectly ordinary one. The cover is owned by it, and Windows keeps
+            # owned windows above their owner, so the UI never flashes before the intro.
+            self._show_main()
+            shown = True
+            if not self._can_fade():
+                raise RuntimeError("window not showing")
+            user32.SetWindowPos(hwnd, None, self.winfo_rootx(), self.winfo_rooty(), size[0], size[1],
+                                SWP_NOACTIVATE | 0x0004)  # SWP_NOZORDER: line up exactly with the real window
+            win.bind("<ButtonPress>", lambda _e: self._skip_intro())
+            # Keys go to the main window; a sink with no other bindings takes them for now, so a key
+            # that skips the intro can't also press something in the UI underneath.
+            sink = tk.Frame(self, width=1, height=1, bg=VOID, takefocus=0)
+            sink.place(x=0, y=0)
+            sink.bindtags((str(sink),))
+            sink.bind("<KeyPress>", lambda _e: self._skip_intro())
+            sink.update_idletasks()  # mapped first, or Tk only remembers the focus for later
+            sink.focus_set()
             mark = INTRO_MARK[2]
             self.intro = {
-                "win": win, "label": label, "hwnd": hwnd, "photo": photo, "level": level,
+                "win": win, "label": label, "hwnd": hwnd, "photo": photo, "level": level, "sink": sink,
                 "start": time.monotonic(), "length": INTRO_SECONDS[level], "sky": sky, "black": black,
                 "snapshot": None, "word": {}, "leaving": None,
-                "glow": self.painter.intro_glow(px(mark)), "spikes": self.painter.intro_spikes(px(170)),
+                "glow": self.painter.intro_glow(px(mark)),
             }
         except Exception as exc:
-            self._end_intro()
+            try:
+                win.destroy()  # may not exist yet
+            except Exception:
+                pass
+            self.intro = None
+            if not shown:
+                self._show_main()
             if str(exc) not in ("window not showing", "motion is off"):
                 self._write_log_file("WARN", f"Startup intro skipped: {exc!r}")
             return
-        self.attributes("-alpha", 1.0)  # the intro covers it now
         self._intro_step()
 
     def _intro_frame(self, t: float) -> Image.Image:
-        """One frame of the intro at t seconds."""
+        """One frame of the intro at t intro seconds (see INTRO_PACE)."""
         intro, px, painter = self.intro, self.px, self.painter
         full = intro["level"] == "full"
         cx, cy, mark = INTRO_MARK
@@ -6470,15 +6481,14 @@ class OptimizerApp(ctk.CTk):
             arm = 1 + 2.4 * (arm_t - 1) ** 3 + 1.4 * (arm_t - 1) ** 2 if arm_t > 0 else 0.0  # ease-out-back
             sweep = ease_in_out(span(0.38, 1.08))
             word_in = ease_out(span(0.78, 1.28))
-            fly = ease_in_out(span(1.40, 1.80))
-            reveal = ease_in_out(span(1.42, 1.78))
-            vanish = span(1.66, 1.84)  # gone before the end, so nothing shows double over the real UI
-            spike = ease_out(span(0.10, 0.50)) * (1 - span(0.42, 0.98))
-            glow = (ease_out(span(0.10, 0.45)) * (1 - 0.55 * span(0.45, 1.0))) * (1 - span(1.42, 1.66))
+            fly = ease_in_out(span(1.65, 2.05))
+            reveal = ease_in_out(span(1.67, 2.03))
+            vanish = span(1.91, 2.09)  # gone before the end, so nothing shows double over the real UI
+            glow = (ease_out(span(0.10, 0.45)) * (1 - 0.55 * span(0.45, 1.0))) * (1 - span(1.67, 1.91))
         else:  # reduced: no movement, the finished mark simply fades in and hands over
             dawn = word_in = ease_out(span(0.0, 0.30))
             arm, sweep = 1.0, 1.0
-            fly, vanish, spike = 0.0, 0.0, 0.0
+            fly, vanish = 0.0, 0.0
             reveal = ease_in_out(span(0.55, 0.95))
             glow = 0.45 * dawn * (1 - reveal)
 
@@ -6493,11 +6503,6 @@ class OptimizerApp(ctk.CTk):
         mx = cx + (gx + gs / 2 - cx) * fly
         my = cy + (gy + gs / 2 - cy) * fly
         msize = mark + (gs - mark) * fly
-        if spike > 0.01:
-            img = intro["spikes"]
-            reach = max(2, int(img.width * (0.35 + 0.65 * spike)))
-            img = faded(img.resize((reach, reach), Image.Resampling.BILINEAR), spike * keep)
-            paste_layer(frame, img, px(mx) - reach // 2, px(my) - reach // 2)
         if glow > 0.01:
             img = intro["glow"]
             g = max(2, int(img.width * msize / mark))
@@ -6538,7 +6543,7 @@ class OptimizerApp(ctk.CTk):
             self._end_intro()
             return
         try:
-            t = time.monotonic() - intro["start"]
+            t = (time.monotonic() - intro["start"]) / INTRO_PACE[intro["level"]]
             leaving = intro["leaving"]
             if leaving is not None:  # skipped: fade the cover away quickly
                 k = (time.monotonic() - leaving) / 0.16
@@ -6548,7 +6553,7 @@ class OptimizerApp(ctk.CTk):
                 intro["win"].attributes("-alpha", (1 - k) ** 1.6)
                 self.after(16, self._intro_step)
                 return
-            handoff = 1.42 if intro["level"] == "full" else 0.55
+            handoff = INTRO_HANDOFF[intro["level"]]
             if intro["snapshot"] is None and t >= handoff - 0.05:
                 snap = capture_window(self._hwnd())
                 if snap is None or snap.size != intro["sky"].size:
@@ -6575,25 +6580,33 @@ class OptimizerApp(ctk.CTk):
 
     def _end_intro(self) -> None:
         intro, self.intro = self.intro, None
-        try:
-            self.attributes("-alpha", 1.0)
-            hwnd = self._hwnd()
-            ex = user32.GetWindowLongPtrW(hwnd, GWL_EXSTYLE)
-            if ex & WS_EX_LAYERED:  # Tk leaves the window layered after an alpha change
-                user32.SetWindowLongPtrW(hwnd, GWL_EXSTYLE, ex & ~WS_EX_LAYERED)
-                user32.RedrawWindow(hwnd, None, None, RDW_INVALIDATE | RDW_ALLCHILDREN | RDW_FRAME | RDW_UPDATENOW)
-        except Exception:
-            pass
         if intro is not None:
-            try:
-                intro["win"].destroy()
-            except tk.TclError:
-                pass
-            if not self._closing:
+            for key in ("sink", "win"):
                 try:
-                    self.focus_force()
+                    intro[key].destroy()
                 except tk.TclError:
                     pass
+            if not self._closing:
+                self._ensure_in_front()
+
+    def _ensure_in_front(self) -> None:
+        """After the intro: make sure the window is up front. If Windows gave the foreground to another
+        app meanwhile, a brief topmost flip still raises it into view (that is allowed when activation isn't)."""
+        try:
+            self.focus_set()
+            hwnd = self._hwnd()
+            front = user32.GetForegroundWindow()
+            if front == hwnd or self.state() != "normal":
+                return
+            name = ctypes.create_unicode_buffer(96)
+            user32.GetClassNameW(front, name, 96)
+            self._write_log_file("INFO", f"After the intro another window was in front ({name.value or 'none'}); raised Astra")
+            self.attributes("-topmost", True)
+            self.lift()
+            self.focus_force()
+            self.after(60, lambda: self.attributes("-topmost", False))
+        except tk.TclError:
+            pass
 
     def _minimize(self) -> None:
         # Tk refuses iconify() on frameless windows, so ask Windows directly.
