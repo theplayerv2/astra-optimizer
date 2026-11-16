@@ -50,6 +50,7 @@ Six switches for ads and tracking built into Windows: ads and suggested apps in 
 - Starfield, plain black or your own picture as the background, with blur, dim, panel opacity and frost.
 - Motion: follow Windows, Full, Reduced or Off.
 - Keep running in the tray, start with Windows (elevated, no UAC prompt), a global hotkey (**Ctrl+Alt+O**) to toggle your mode in-game, an optional System Restore point before your first optimize each day, a check for new versions, and **Back up / Restore** to move your settings, games, appearance and session history to another PC in one file.
+- **Hotkeys…** in Settings changes the keys for optimize or undo, the overlay and benchmarks, and tells you if another app already uses one.
 - **Report a problem** (About tab or tray menu) saves one zip to your desktop with your PC specs, a fresh checkup, your last game sessions and the app's log and settings, ready to send with a bug report. If something unexpected goes wrong, Astra logs the details and offers this report straight away.
 
 | | |

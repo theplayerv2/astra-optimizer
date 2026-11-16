@@ -56,8 +56,8 @@ except Exception:  # pragma: no cover - depends on the build
 
 APP_NAME = "Astra Optimizer"
 LEGACY_APP_NAME = "Optimizer"  # pre-1.12 name: data folder and startup task are carried over
-APP_VERSION = "1.7.0"
-DISPLAY_VERSION = "v1.7.0"
+APP_VERSION = "1.7.1"
+DISPLAY_VERSION = "v1.7.1"
 CREDIT_NAME = "theplayerv2"
 UPDATE_REPO = "theplayerv2/astra-optimizer"
 CREDIT_URL = f"https://github.com/{UPDATE_REPO}"
@@ -2415,6 +2415,39 @@ OVERLAY_HOTKEY_LABEL = "Ctrl+Alt+F"
 OVERLAY_HOTKEY_VK = ord("F")
 BENCH_HOTKEY_LABEL = "Ctrl+Alt+K"
 BENCH_HOTKEY_VK = ord("K")
+MOD_SHIFT = 0x0004
+# action: (what it does, default modifiers, default key, RegisterHotKey id, event it posts)
+HOTKEY_ACTIONS = {
+    "toggle": ("Optimize or undo", MOD_CONTROL | MOD_ALT, HOTKEY_VK, 1, "hotkey"),
+    "overlay": ("FPS overlay", MOD_CONTROL | MOD_ALT, OVERLAY_HOTKEY_VK, 2, "overlay-hotkey"),
+    "bench": ("Benchmark", MOD_CONTROL | MOD_ALT, BENCH_HOTKEY_VK, 3, "bench-hotkey"),
+}
+_HOTKEY_KEY_NAMES = {0x2D: "Insert", 0x2E: "Delete", 0x24: "Home", 0x23: "End", 0x21: "Page Up", 0x22: "Page Down",
+                     0x13: "Pause", 0x91: "Scroll Lock", **{0x60 + i: f"Num {i}" for i in range(10)},
+                     **{0x70 + i: f"F{i + 1}" for i in range(24)}}
+_MODIFIER_VKS = {0x10, 0x11, 0x12, 0x14, 0x5B, 0x5C, 0xA0, 0xA1, 0xA2, 0xA3, 0xA4, 0xA5}
+
+
+def hotkey_key_name(vk: int) -> str | None:
+    if 0x30 <= vk <= 0x39 or 0x41 <= vk <= 0x5A:
+        return chr(vk)
+    return _HOTKEY_KEY_NAMES.get(vk)
+
+
+def hotkey_label(mods: int, vk: int) -> str:
+    parts = [name for bit, name in ((MOD_CONTROL, "Ctrl"), (MOD_ALT, "Alt"), (MOD_SHIFT, "Shift")) if mods & bit]
+    return "+".join(parts + [hotkey_key_name(vk) or f"key {vk}"])
+
+
+def hotkey_problem(mods: int, vk: int) -> str | None:
+    """Why this can't be a hotkey, or None when it can."""
+    if hotkey_key_name(vk) is None:
+        return "Use a letter, a number, an F key or a key like Insert or Page Up."
+    if 0x70 <= vk <= 0x87:
+        return None  # an F key works on its own
+    if not mods & (MOD_CONTROL | MOD_ALT):
+        return "Add Ctrl or Alt, so it doesn't fire while you type."
+    return None
 AUTOSTART_TASK = "Astra Optimizer Autostart"
 LEGACY_AUTOSTART_TASK = "Optimizer Autostart"
 INSTANCE_EVENT = "Local\\AstraOptimizerShowWindow"
@@ -2425,7 +2458,7 @@ DEFAULT_SETTINGS = {"tray": True, "autostart": False, "hotkey": True, "custom_ho
                     "dns_original": None,
                     "restore_point": True, "restore_point_at": 0, "updates": True, "sessions": [],
                     "overlay": True, "overlay_pos": None, "overlay_style": None,
-                    "slow_background": False}
+                    "slow_background": False, "hotkeys": {}}
 
 
 # --------------------------------------------------------------------------------------
@@ -2725,10 +2758,11 @@ def write_problem_report(path: str, app_info: dict, games: list[dict], sessions:
 class HotkeyThread(threading.Thread):
     """Owns a RegisterHotKey registration and its message loop; posts ("hotkey",) to the queue."""
 
-    def __init__(self, out_queue: queue.Queue, hotkey_id: int = 1, vk: int = HOTKEY_VK, event: str = "hotkey"):
+    def __init__(self, out_queue: queue.Queue, hotkey_id: int = 1, vk: int = HOTKEY_VK, event: str = "hotkey",
+                 modifiers: int = MOD_CONTROL | MOD_ALT):
         super().__init__(name=event, daemon=True)
         self.out_queue = out_queue
-        self.hotkey_id, self.vk, self.event = hotkey_id, vk, event
+        self.hotkey_id, self.vk, self.event, self.modifiers = hotkey_id, vk, event, modifiers
         self.ready = threading.Event()
         self.ok = False
         self.thread_id = 0
@@ -2736,7 +2770,7 @@ class HotkeyThread(threading.Thread):
     def run(self) -> None:
         self.thread_id = kernel32.GetCurrentThreadId()
         msg = wintypes.MSG()
-        self.ok = bool(user32.RegisterHotKey(None, self.hotkey_id, MOD_CONTROL | MOD_ALT | MOD_NOREPEAT, self.vk))
+        self.ok = bool(user32.RegisterHotKey(None, self.hotkey_id, self.modifiers | MOD_NOREPEAT, self.vk))
         self.ready.set()
         if not self.ok:
             return
@@ -2750,6 +2784,8 @@ class HotkeyThread(threading.Thread):
     def stop(self) -> None:
         if self.ok and self.thread_id:
             user32.PostThreadMessageW(self.thread_id, WM_QUIT, 0, 0)
+            if self.is_alive() and threading.current_thread() is not self:
+                self.join(1.0)  # its finally unregisters the key; wait so it can be taken again at once
 
 
 def launch_command() -> tuple[str, str]:
@@ -2878,9 +2914,9 @@ class TrayIcon:
             pystray.MenuItem(lambda item: app.tray_primary_label(), send("toggle"),
                              enabled=lambda item: app.admin and not app.busy),
             pystray.MenuItem("Mode", pystray.Menu(*modes)),
-            pystray.MenuItem(f"Overlay ({OVERLAY_HOTKEY_LABEL})", send("overlay"),
+            pystray.MenuItem(lambda item: f"Overlay ({app._hk('overlay')})", send("overlay"),
                              checked=lambda item: app.overlay_visible()),
-            pystray.MenuItem(lambda item: "Cancel benchmark" if app.bench else f"Benchmark {BENCH_SECONDS} s ({BENCH_HOTKEY_LABEL})",
+            pystray.MenuItem(lambda item: "Cancel benchmark" if app.bench else f"Benchmark {BENCH_SECONDS} s ({app._hk('bench')})",
                              send("bench"), enabled=lambda item: bool(app.bench or app.sessions_live)),
             pystray.MenuItem("Report a problem", send("report"), enabled=lambda item: not app.report_busy),
             pystray.Menu.SEPARATOR,
@@ -4451,6 +4487,8 @@ def merge_backup(current: dict, backup: dict) -> dict:
             continue
         if isinstance(default, list) and not isinstance(value, list):
             continue
+        if isinstance(default, dict) and not isinstance(value, dict):
+            continue
         merged[key] = value
     games = []
     for game in merged.get("games") or []:
@@ -4850,7 +4888,6 @@ L_GAME_AUTO = (78, 424, 628, 42)
 L_GAME_SPLIT = 210   # the bottom row holds three switches: auto mode | overlay | background apps
 L_GAME_SPLIT2 = 414
 GAME_AUTO_TEXT = "Auto-apply my mode"
-GAME_OVERLAY_TEXT = f"FPS overlay · {OVERLAY_HOTKEY_LABEL}"
 GAME_BACKGROUND_TEXT = "Slow background apps"
 L_HIST_COLS = {"fps": 382, "cpu": 456, "gpu": 522, "temp": 588, "ping": 654}  # centre of each stat column
 L_CMP_COLS = {"a": 438, "b": 540, "chg": 646}  # Compare view: older, newer, change
@@ -4880,6 +4917,7 @@ L_FOLDER_ROW = (78, 416, 628, 46)
 L_SETTING_BUTTONS = {"backup": (386, 420, 92, 38), "restore": (486, 420, 92, 38), "folder": (586, 420, 104, 38)}
 SETTING_BUTTON_TEXT = {"backup": "Back up…", "restore": "Restore…", "folder": "Open folder"}
 L_PROTECT_BUTTON = (78 + 628 - 20 - 44 - 16 - 104, L_SETTING_ROWS["restore"][1] + 9, 104, 30)  # "Turn on…"
+L_HOTKEYS_BUTTON = (78 + 628 - 20 - 44 - 16 - 104, L_SETTING_ROWS["hotkey"][1] + 9, 104, 30)  # "Hotkeys…"
 L_DIALOG_W = 404
 # Privacy tab (same row geometry as Settings)
 L_PRIV_ROWS = {key: (78, 96 + i * 53, 628, 48) for i, key in enumerate(PRIVACY_KEYS)}
@@ -5912,10 +5950,10 @@ class OverlayWindow:
             self._vars.append(var)
             menu.add_checkbutton(label=label, variable=var, command=lambda k=key, v=var: self.set_style(k, v.get()))
         menu.add_separator()
-        menu.add_command(label=(f"Cancel benchmark  ({BENCH_HOTKEY_LABEL})" if self.app.bench
-                                else f"Benchmark {BENCH_SECONDS} s  ({BENCH_HOTKEY_LABEL})"),
+        menu.add_command(label=(f"Cancel benchmark  ({self.app._hk('bench')})" if self.app.bench
+                                else f"Benchmark {BENCH_SECONDS} s  ({self.app._hk('bench')})"),
                          command=self.app._toggle_benchmark)
-        menu.add_command(label=f"Hide overlay  ({OVERLAY_HOTKEY_LABEL})", command=lambda: self.app._toggle_overlay(False))
+        menu.add_command(label=f"Hide overlay  ({self.app._hk('overlay')})", command=lambda: self.app._toggle_overlay(False))
         # Windows only closes a popup menu on a click outside it while the menu's window is in the
         # foreground, and the overlay normally never is (it doesn't take focus). So it may take focus
         # just while the menu is open, then the game gets it back.
@@ -6686,12 +6724,12 @@ class OptimizerApp(ctk.CTk):
         c.create_text(px(CX), px(52), anchor="nw", text="Settings", font=self.f_title, fill=TEXT_HI, tags=settings)
         c.create_text(px(CX), px(74), anchor="nw", font=self.f_purpose, fill=TEXT_MID, tags=settings,
                       text="Saved on this PC and applied straight away.")
-        self.t_setting_desc = {}
+        self.t_setting_desc, self.t_setting_title = {}, {}
         for key, (x, y, w, h) in L_SETTING_ROWS.items():
             title, desc = SETTING_TEXT[key]
             ty, dy = L_SETTING_TEXT_Y
-            c.create_text(px(x + 20), px(y + ty), anchor="nw", text=title, font=self.f_title, fill=TEXT_HI,
-                          tags=settings)
+            self.t_setting_title[key] = c.create_text(px(x + 20), px(y + ty), anchor="nw", text=title,
+                                                      font=self.f_title, fill=TEXT_HI, tags=settings)
             self.t_setting_desc[key] = c.create_text(px(x + 20), px(y + dy), anchor="nw", font=self.f_desc,
                                                      fill=TEXT_MID, tags=settings)
             self._set_setting_desc(key, desc)
@@ -6700,6 +6738,10 @@ class OptimizerApp(ctk.CTk):
             self._set_setting_desc("restore", "Needs administrator rights - restart the app and accept UAC.")
         if pystray is None:
             self._set_setting_desc("tray", "Tray support is not included in this build.")
+        bx, by, bw, bh = L_HOTKEYS_BUTTON
+        self.t_buttons["hotkeys"] = c.create_text(px(bx + bw / 2), px(by + bh / 2), text="Hotkeys…",
+                                                  font=self.f_ghost_small, fill=TEXT_HI, tags=settings)
+        self._refresh_hotkey_labels()
         bx, by, bw, bh = L_PROTECT_BUTTON
         self.t_buttons["protect"] = c.create_text(px(bx + bw / 2), px(by + bh / 2), text="Turn on…",
                                                   font=self.f_ghost_small, fill=TEXT_HI, tags=(*settings, "protect-btn"))
@@ -6873,7 +6915,7 @@ class OptimizerApp(ctk.CTk):
         self.t_game_auto = c.create_text(px(ax + 76), px(ay + ah / 2), anchor="w", font=self.f_desc, fill=TEXT_HI,
                                          tags=g, text=GAME_AUTO_TEXT)
         self.t_game_overlay = c.create_text(px(ax + L_GAME_SPLIT + 58), px(ay + ah / 2), anchor="w", font=self.f_desc,
-                                            fill=TEXT_HI, tags=g, text=GAME_OVERLAY_TEXT)
+                                            fill=TEXT_HI, tags=g, text=self._game_overlay_text())
         self.t_game_background = c.create_text(px(ax + L_GAME_SPLIT2 + 58), px(ay + ah / 2), anchor="w",
                                                font=self.f_desc, fill=TEXT_HI, tags=g, text=GAME_BACKGROUND_TEXT)
 
@@ -7051,6 +7093,8 @@ class OptimizerApp(ctk.CTk):
         self._caret_job = self.after(530, self._blink_caret)
 
     def _on_host_key(self, event):
+        if self.dialog and self.dialog.get("recording"):
+            return self._on_hotkey_record(event)
         if not self.host_focus:
             return None
         keysym, ctrl = event.keysym, bool(event.state & 0x4)
@@ -7113,7 +7157,8 @@ class OptimizerApp(ctk.CTk):
 
     def _set_setting_desc(self, key: str, text: str, color: str = TEXT_MID) -> None:
         x, _y, w, _h = L_SETTING_ROWS[key]
-        room = w - 120 - (L_PROTECT_BUTTON[2] + 14 if key == "restore" and self.protection is False else 0)
+        room = w - 120 - (L_PROTECT_BUTTON[2] + 14 if key == "restore" and self.protection is False else 0) \
+            - (L_HOTKEYS_BUTTON[2] + 14 if key == "hotkey" else 0)
         self.canvas.itemconfigure(self.t_setting_desc[key], text=self._fit(text, self.f_desc, room), fill=color)
 
     def _refresh_restore_row(self) -> None:
@@ -7242,7 +7287,7 @@ class OptimizerApp(ctk.CTk):
             return tools_page == "startup"
         if key == "clean":
             return tools_page == "cleanup" and self.clean_state == "idle" and self._clean_total()[1] > 0
-        if key in ("folder", "backup", "restore"):
+        if key in ("folder", "backup", "restore", "hotkeys"):
             return self.tab == "settings"
         if key == "profile":
             return self.tab == "about"
@@ -7369,6 +7414,16 @@ class OptimizerApp(ctk.CTk):
             x, y, w, h = self.dialog["rect"]
             panel, m = self._cached(("panel", w, h), lambda: self.painter.panel(px(w), px(h), STARLIGHT))
             paste_layer(scene, panel, px(x) - m, px(y) - m)
+            for action, chip in (self.dialog.get("chips") or {}).items():
+                if self.dialog.get("recording") == action:
+                    chip_state = "pressed"
+                else:
+                    chip_state = "hover" if self.hover == f"dlg:chip:{action}" else "normal"
+                bx, by, bw, bh = chip["rect"]
+                img = self._cached(("dlg-chip", bw, bh, chip_state),
+                                   lambda: self.painter.ghost_button(px(bw), px(bh), chip_state))
+                paste_layer(scene, img, px(bx), px(by))
+                self.canvas.itemconfigure(chip["text"], fill="#CFCFCF" if chip_state == "normal" else "#FFFFFF")
             if self.dialog["needs_check"]:
                 bx, by, bs = self.dialog["box"]
                 checked, hovered = self.dialog["checked"], self.hover == "dlg:check"
@@ -7445,6 +7500,7 @@ class OptimizerApp(ctk.CTk):
                     self._render_ghost(scene, key, rect)
                 if self.protection is False and self.admin:
                     self._render_ghost(scene, "protect", L_PROTECT_BUTTON)
+                self._render_ghost(scene, "hotkeys", L_HOTKEYS_BUTTON)
 
             for key, (x, y, w, h) in L_WINDOW_BUTTONS.items():
                 target = f"win:{key}"
@@ -7715,6 +7771,9 @@ class OptimizerApp(ctk.CTk):
                 return "dlg:cancel"
             if self.dialog["needs_check"] and inside(self.dialog["check_rect"]):
                 return "dlg:check"
+            for action, chip in (self.dialog.get("chips") or {}).items():
+                if inside(chip["rect"]):
+                    return f"dlg:chip:{action}"
             return "drag" if ly < L_TITLE_H else None
         for key, rect in L_WINDOW_BUTTONS.items():
             if inside(rect):
@@ -7833,6 +7892,8 @@ class OptimizerApp(ctk.CTk):
                     return f"btn:{key}"
             if self.protection is False and self.admin and inside(L_PROTECT_BUTTON):
                 return "btn:protect"
+            if inside(L_HOTKEYS_BUTTON):
+                return "btn:hotkeys"
             for key, rect in L_SETTING_ROWS.items():
                 if inside(rect):
                     return f"set:{key}"
@@ -8023,6 +8084,8 @@ class OptimizerApp(ctk.CTk):
                     self._open_link(self.update_info["url"])
             else:
                 self._check_updates(manual=True)
+        elif target == "btn:hotkeys":
+            self._open_hotkeys()
         elif target == "btn:protect":
             self._confirm_protection()
         elif kind == "game":
@@ -8075,6 +8138,10 @@ class OptimizerApp(ctk.CTk):
             self.dialog["checked"] = not self.dialog["checked"]
             self.canvas.configure(cursor="hand2")
             self._render()
+        elif kind == "dlg" and self.dialog and key.startswith("chip:"):
+            self._record_hotkey_start(key[5:])
+        elif kind == "dlg" and self.dialog and key == "cancel" and self.dialog.get("on_cancel"):
+            self.dialog["on_cancel"]()
         elif kind == "dlg" and self.dialog:
             if key == "ok" and not self._enabled("dlg:ok"):
                 return
@@ -8090,6 +8157,8 @@ class OptimizerApp(ctk.CTk):
             return False
 
     def _on_return(self, _event) -> None:
+        if self.dialog and self.dialog.get("recording"):
+            return
         if self.dialog:
             self._activate("dlg:ok")
         elif self._typing():
@@ -8104,7 +8173,10 @@ class OptimizerApp(ctk.CTk):
             self._activate("dlg:check")
 
     def _on_escape(self, _event) -> None:
-        if self.dialog:
+        if self.dialog and self.dialog.get("recording"):
+            self._record_hotkey_stop()
+            self._hotkey_status("")
+        elif self.dialog:
             self._close_dialog()
         elif self._typing():
             self._blur_host()
@@ -8296,7 +8368,8 @@ class OptimizerApp(ctk.CTk):
         return ((bbox[3] - bbox[1]) if bbox else 0) / self.scale
 
     def _open_dialog(self, title: str, body: str, ok_label: str, on_ok, cancel_label: str | None = "Cancel",
-                     confirm_text: str | None = None, width: int = L_DIALOG_W) -> None:
+                     confirm_text: str | None = None, width: int = L_DIALOG_W, extra_h: int = 0,
+                     on_cancel=None) -> None:
         """Themed modal. With confirm_text, the confirm button stays disabled until the box is ticked."""
         px = self.px
         backdrop = self._scene.filter(ImageFilter.GaussianBlur(px(4)))
@@ -8307,7 +8380,7 @@ class OptimizerApp(ctk.CTk):
         check_h = 0.0
         if confirm_text:
             check_h = max(20.0, self._text_height(confirm_text, self.f_dialog_body, inner - 32)) + 18
-        h = round(60 + body_h + check_h + 24 + 40 + 24)
+        h = round(60 + body_h + check_h + extra_h + 24 + 40 + 24)
         x, y = (WINDOW_W - w) // 2, max(L_TITLE_H + 8, (WINDOW_H - h) // 2)
         ok_rect = (x + w - 26 - 176, y + h - 24 - 40, 176, 40)
         cancel_rect = (ok_rect[0] - 12 - 112, ok_rect[1], 112, 40) if cancel_label else None
@@ -8334,14 +8407,18 @@ class OptimizerApp(ctk.CTk):
         self.canvas.configure(cursor="")
         self.dialog = {"backdrop": backdrop, "on_ok": on_ok, "rect": (x, y, w, h), "ok_rect": ok_rect,
                        "cancel_rect": cancel_rect, "ok_text": ok_text, "cancel_text": cancel_text,
-                       "needs_check": bool(confirm_text), "checked": False, "box": box, "check_rect": check_rect}
+                       "needs_check": bool(confirm_text), "checked": False, "box": box, "check_rect": check_rect,
+                       "body_bottom": y + 60 + body_h + check_h, "on_cancel": on_cancel}
         self.canvas.focus_set()
         self._transition(lambda: (self._apply_visibility(), self._render()))
 
     def _close_dialog(self) -> None:
         if not self.dialog:
             return
+        recording = self.dialog.get("recording")
         self.dialog = None
+        if recording:
+            self._restart_hotkeys()
         self.canvas.delete("dialog")
         self.hover = self.pressed = None
         self._transition(lambda: (self._apply_visibility(), self._render()))
@@ -8668,7 +8745,7 @@ class OptimizerApp(ctk.CTk):
             ok, _warn, fail = result
             failed = f", {fail} failed" if fail else ""
             if applied in PROFILE_TITLES:
-                again = f" Press {HOTKEY_LABEL} again to undo." if self.hotkey else ""
+                again = f" Press {self._hk('toggle')} again to undo." if self.hotkey else ""
                 lines = self._summary_lines(result, stats) if stats else [f"{ok} change(s) made{failed}"]
                 self._notify(f"{PROFILE_TITLES[applied]} applied", "; ".join(lines[:3]) + f".{again}")
             else:
@@ -8688,7 +8765,7 @@ class OptimizerApp(ctk.CTk):
         if self._setting("tray"):
             self._start_tray()
         if self._setting("hotkey") and self._start_hotkey():
-            self._emit("info", f"Hotkey {HOTKEY_LABEL} toggles {PROFILE_TITLES[self.profile]} on and off")
+            self._emit("info", f"Hotkey {self._hk('toggle')} toggles {PROFILE_TITLES[self.profile]} on and off")
         if instance_event:
             threading.Thread(target=self._watch_instance, args=(instance_event,), name="instance",
                              daemon=True).start()
@@ -8796,7 +8873,7 @@ class OptimizerApp(ctk.CTk):
         self.bench = {"exe": exe, "name": session["name"], "phase": "countdown", "label": self._bench_mode_label(),
                       "until": time.monotonic() + BENCH_COUNTDOWN, "opened_overlay": opened}
         self._emit("info", f"Benchmark of {session['name']} starts in {BENCH_COUNTDOWN} s and runs for {BENCH_SECONDS} s "
-                           f"with {self.bench['label']} applied. Play normally; {BENCH_HOTKEY_LABEL} cancels it.")
+                           f"with {self.bench['label']} applied. Play normally; {self._hk('bench')} cancels it.")
         self._tray_refresh()
         self.after(100, self._bench_tick)
 
@@ -8875,30 +8952,25 @@ class OptimizerApp(ctk.CTk):
         self.after(500, self._overlay_tick)
 
     def _start_overlay_hotkey(self) -> None:
-        hotkey = HotkeyThread(self.events, 2, OVERLAY_HOTKEY_VK, "overlay-hotkey")
-        hotkey.start()
-        hotkey.ready.wait(2.0)
-        if hotkey.ok:
+        self._extra_hotkeys_on = True
+        hotkey = self._register_hotkey("overlay")
+        if hotkey is not None:
             self.overlay_hotkey = hotkey
         else:
-            self._emit("warn", f"{OVERLAY_HOTKEY_LABEL} is already taken by another app; use the tray menu for the overlay")
-        bench = HotkeyThread(self.events, 3, BENCH_HOTKEY_VK, "bench-hotkey")
-        bench.start()
-        bench.ready.wait(2.0)
-        if bench.ok:
+            self._emit("warn", f"{self._hk('overlay')} is already taken by another app; use the tray menu for the overlay")
+        bench = self._register_hotkey("bench")
+        if bench is not None:
             self.bench_hotkey = bench
         else:
-            self._emit("warn", f"{BENCH_HOTKEY_LABEL} is already taken by another app; "
+            self._emit("warn", f"{self._hk('bench')} is already taken by another app; "
                                "start benchmarks from the tray menu or the overlay's right-click menu")
 
     def _start_hotkey(self) -> bool:
         if self.hotkey is not None:
             return True
-        hotkey = HotkeyThread(self.events)
-        hotkey.start()
-        hotkey.ready.wait(2.0)
-        if not hotkey.ok:
-            self._emit("warn", f"{HOTKEY_LABEL} is already taken by another app, so the hotkey is off")
+        hotkey = self._register_hotkey("toggle")
+        if hotkey is None:
+            self._emit("warn", f"{self._hk('toggle')} is already taken by another app, so the hotkey is off")
             return False
         self.hotkey = hotkey
         return True
@@ -8907,6 +8979,151 @@ class OptimizerApp(ctk.CTk):
         if self.hotkey is not None:
             self.hotkey.stop()
             self.hotkey = None
+
+    # ---------------- hotkeys you choose (Settings → Hotkeys…) ----------------
+
+    def _hotkey_spec(self, action: str) -> tuple[int, int]:
+        _what, mods, vk, _id, _event = HOTKEY_ACTIONS[action]
+        saved = self._setting("hotkeys")
+        chosen = saved.get(action) if isinstance(saved, dict) else None
+        if isinstance(chosen, list) and len(chosen) == 2 and all(isinstance(v, int) for v in chosen) \
+                and hotkey_problem(chosen[0], chosen[1]) is None:
+            return chosen[0], chosen[1]
+        return mods, vk
+
+    def _hk(self, action: str) -> str:
+        return hotkey_label(*self._hotkey_spec(action))
+
+    def _game_overlay_text(self) -> str:
+        return f"FPS overlay · {self._hk('overlay')}"
+
+    def _register_hotkey(self, action: str) -> "HotkeyThread | None":
+        _what, _mods, _vk, hotkey_id, event = HOTKEY_ACTIONS[action]
+        mods, vk = self._hotkey_spec(action)
+        hotkey = HotkeyThread(self.events, hotkey_id, vk, event, mods)
+        hotkey.start()
+        hotkey.ready.wait(2.0)
+        return hotkey if hotkey.ok else None
+
+    def _stop_all_hotkeys(self) -> None:
+        self._stop_hotkey()
+        for attr in ("overlay_hotkey", "bench_hotkey"):
+            hotkey = getattr(self, attr)
+            if hotkey is not None:
+                hotkey.stop()
+                setattr(self, attr, None)
+
+    def _restart_hotkeys(self) -> None:
+        """Register every hotkey again from the settings (after a change, a backup or the picker)."""
+        self._stop_all_hotkeys()
+        if self._setting("hotkey"):
+            self._start_hotkey()
+        if getattr(self, "_extra_hotkeys_on", False):
+            self._start_overlay_hotkey()
+        self._refresh_hotkey_labels()
+
+    def _refresh_hotkey_labels(self) -> None:
+        title = SETTING_TEXT["hotkey"][0].split("\u00b7")[0].rstrip()
+        self.canvas.itemconfigure(self.t_setting_title["hotkey"],
+                                  text=self._fit(f"{title}  \u00b7  {self._hk('toggle')}", self.f_title, 360))
+        if getattr(self, "t_game_overlay", None) and self.canvas.itemcget(self.t_game_overlay, "text").startswith("FPS overlay"):
+            self.canvas.itemconfigure(self.t_game_overlay, text=self._game_overlay_text())
+        if getattr(self, "tray", None) is not None:
+            self._tray_refresh()
+
+    def _open_hotkeys(self) -> None:
+        actions = list(HOTKEY_ACTIONS)
+        self._open_dialog("Hotkeys", "Click one, then press the keys you want: Ctrl or Alt with a letter or number, "
+                                     "or an F key on its own. They work in games too.",
+                          "Done", lambda: None, cancel_label="Defaults", width=460,
+                          extra_h=len(actions) * 46 + 34, on_cancel=self._reset_hotkeys)
+        c, px = self.canvas, self.px
+        x, y, w, _h = self.dialog["rect"]
+        top = self.dialog["body_bottom"] + 14
+        chips = {}
+        for i, action in enumerate(actions):
+            ry = top + i * 46
+            c.create_text(px(x + 26), px(ry + 17), anchor="w", text=HOTKEY_ACTIONS[action][0],
+                          font=self.f_dialog_body, fill=TEXT_HI, tags="dialog")
+            rect = (x + w - 26 - 200, ry, 200, 34)
+            text = c.create_text(px(rect[0] + rect[2] / 2), px(ry + 17), text=self._hk(action), font=self.f_ghost,
+                                 fill="#CFCFCF", tags="dialog")
+            chips[action] = {"rect": rect, "text": text}
+        status = c.create_text(px(x + 26), px(top + len(actions) * 46 + 2), anchor="nw", text="", font=self.f_desc,
+                               fill=TEXT_MID, width=px(w - 52), tags="dialog")
+        self.dialog.update(chips=chips, status=status, recording=None)
+        self._render()
+
+    def _hotkey_status(self, text: str, color: str = TEXT_MID) -> None:
+        if self.dialog and self.dialog.get("status"):
+            self.canvas.itemconfigure(self.dialog["status"], text=text, fill=color)
+
+    def _record_hotkey_start(self, action: str) -> None:
+        if self.dialog.get("recording"):
+            self._record_hotkey_stop()
+        self.dialog["recording"] = action
+        self._stop_all_hotkeys()  # so pressing one of Astra's own keys reaches the window
+        self.canvas.itemconfigure(self.dialog["chips"][action]["text"], text="Press keys…")
+        self._hotkey_status(f"Press the new keys for {HOTKEY_ACTIONS[action][0].lower()}, "
+                            f"or Esc to keep {self._hk(action)}.")
+        self.canvas.focus_set()
+        self._render()
+
+    def _record_hotkey_stop(self) -> None:
+        action = self.dialog.get("recording") if self.dialog else None
+        if not action:
+            return
+        self.dialog["recording"] = None
+        self.canvas.itemconfigure(self.dialog["chips"][action]["text"], text=self._hk(action))
+        self._restart_hotkeys()
+        self._render()
+
+    def _on_hotkey_record(self, event):
+        action = self.dialog["recording"]
+        vk = int(event.keycode or 0)
+        if event.keysym == "Escape" or vk in _MODIFIER_VKS:
+            return "break"  # Esc is handled by its own binding; a modifier alone isn't a choice yet
+        mods = ((MOD_CONTROL if event.state & 0x0004 else 0) | (MOD_ALT if event.state & 0x20000 else 0)
+                | (MOD_SHIFT if event.state & 0x0001 else 0))
+        problem = hotkey_problem(mods, vk)
+        if problem:
+            self._hotkey_status(problem, WARN_YELLOW)
+            return "break"
+        label = hotkey_label(mods, vk)
+        for other in HOTKEY_ACTIONS:
+            if other != action and self._hotkey_spec(other) == (mods, vk):
+                self._hotkey_status(f"{label} is already the {HOTKEY_ACTIONS[other][0].lower()} hotkey.", WARN_YELLOW)
+                return "break"
+        test = HotkeyThread(self.events, 9, vk, "hotkey-test", mods)
+        test.start()
+        test.ready.wait(2.0)
+        free = test.ok
+        test.stop()
+        if not free:
+            self._hotkey_status(f"{label} is taken by another app. Try another.", WARN_YELLOW)
+            return "break"
+        saved = dict(self._setting("hotkeys") or {})
+        saved[action] = [mods, vk]
+        self._set_setting("hotkeys", saved)
+        self.dialog["recording"] = None
+        self.canvas.itemconfigure(self.dialog["chips"][action]["text"], text=label)
+        self._restart_hotkeys()
+        self._hotkey_status(f"{HOTKEY_ACTIONS[action][0]} is now {label}.", TEXT_HI)
+        self._emit("ok", f"{HOTKEY_ACTIONS[action][0]} hotkey is now {label}")
+        self._render()
+        return "break"
+
+    def _reset_hotkeys(self) -> None:
+        if self.dialog.get("recording"):
+            self.dialog["recording"] = None
+        self._set_setting("hotkeys", {})
+        self._restart_hotkeys()
+        for action, chip in self.dialog["chips"].items():
+            self.canvas.itemconfigure(chip["text"], text=self._hk(action))
+        defaults = ", ".join(self._hk(a) for a in HOTKEY_ACTIONS)
+        self._hotkey_status(f"Back to the defaults: {defaults}.", TEXT_HI)
+        self._emit("ok", f"Hotkeys back to the defaults ({defaults})")
+        self._render()
 
     def _tray_refresh(self) -> None:
         if self.tray is not None:
@@ -8919,7 +9136,7 @@ class OptimizerApp(ctk.CTk):
         return f"{APP_NAME} - nothing applied"
 
     def tray_primary_label(self) -> str:
-        hint = f"\t{HOTKEY_LABEL}" if self.hotkey else ""
+        hint = f"\t{self._hk('toggle')}" if self.hotkey else ""
         if self.busy:
             return "Working…"
         if self.undo_count:
@@ -9023,7 +9240,7 @@ class OptimizerApp(ctk.CTk):
             if not on:
                 self._stop_hotkey()
             self._set_setting("hotkey", on)
-            self._emit("ok", f"Hotkey {HOTKEY_LABEL} on" if on else f"Hotkey {HOTKEY_LABEL} off")
+            self._emit("ok", f"Hotkey {self._hk('toggle')} on" if on else f"Hotkey {self._hk('toggle')} off")
             self._tray_refresh()
         elif key == "restore":
             on = not self._setting("restore_point")
@@ -9374,10 +9591,7 @@ class OptimizerApp(ctk.CTk):
             self._start_tray()
         elif not merged.get("tray") and self.tray is not None:
             self._stop_tray()
-        if merged.get("hotkey") and self.hotkey is None:
-            self._start_hotkey()
-        elif not merged.get("hotkey") and self.hotkey is not None:
-            self._stop_hotkey()
+        self._restart_hotkeys()
         self._schedule_update_check(5000 if merged.get("updates") else None)
         if self.game_watcher is not None:
             self.game_watcher.slow_background = bool(merged.get("slow_background"))
@@ -9481,8 +9695,8 @@ class OptimizerApp(ctk.CTk):
                 self._toggle_overlay(True, auto=True)
             elif not on and self._overlay_auto:
                 self._toggle_overlay(False)
-            self._emit("ok", f"The FPS overlay will show while a game runs ({OVERLAY_HOTKEY_LABEL} toggles it any time)"
-                       if on else f"The overlay no longer opens by itself; {OVERLAY_HOTKEY_LABEL} still shows it")
+            self._emit("ok", f"The FPS overlay will show while a game runs ({self._hk('overlay')} toggles it any time)"
+                       if on else f"The overlay no longer opens by itself; {self._hk('overlay')} still shows it")
             self._render()
             return
         if what == "auto":
@@ -9955,7 +10169,7 @@ class OptimizerApp(ctk.CTk):
         if self.compare_pick is not None:
             summary = f"Pick two sessions to compare ({len(self.compare_pick)} of 2 picked)"
             if not any(r.get("benchmark") for r in sessions):
-                summary += f". For a fair test, press {BENCH_HOTKEY_LABEL} in the game: a {BENCH_SECONDS} s benchmark"
+                summary += f". For a fair test, press {self._hk('bench')} in the game: a {BENCH_SECONDS} s benchmark"
         else:
             summary = self._history_summary(sessions)
         c.itemconfigure(self.t_game_overlay, text="")
@@ -10115,7 +10329,7 @@ class OptimizerApp(ctk.CTk):
         ax, ay, aw, ah = L_GAME_AUTO
         c.coords(self.t_game_auto, self.px(ax + 76), self.px(ay + ah / 2))
         c.itemconfigure(self.t_game_auto, text=GAME_AUTO_TEXT)
-        c.itemconfigure(self.t_game_overlay, text=GAME_OVERLAY_TEXT)
+        c.itemconfigure(self.t_game_overlay, text=self._game_overlay_text())
         c.itemconfigure(self.t_game_background, text=GAME_BACKGROUND_TEXT)
         c.itemconfigure(self.t_buttons["findgames"], text="Cancel" if finder else "Find games")
         if finder:

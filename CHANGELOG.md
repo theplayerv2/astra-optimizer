@@ -4,6 +4,15 @@ What changed in each version of Astra Optimizer. The newest version is at the to
 
 When a version is tagged on GitHub (for example `v1.2.0`), its section below becomes the release notes.
 
+## v1.7.1 - 2026-11-16
+
+### Added
+- **Choose your own hotkeys:** Settings > **Hotkeys…** lets you pick the keys for optimize or undo, the FPS overlay
+  and benchmarks. Click one and press the new keys: Ctrl or Alt with a letter or number, or an F key on its own.
+  Astra checks it straight away, says so if another app already has it (keeping your old key), and won't let two of
+  its own hotkeys share one. **Defaults** puts all three back. The tray menu, the overlay's menu and the Games tab
+  show the keys you chose, and they're part of settings backups.
+
 ## v1.7.0 - 2026-11-16
 
 ### Added
