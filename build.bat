@@ -91,14 +91,13 @@ if errorlevel 1 (
     goto :fail
 )
 
-rem No --uac-admin: an unsigned exe whose manifest demands administrator rights is a strong antivirus
-rem machine-learning signal. Astra asks for them itself at startup (relaunch_as_admin), the same one UAC prompt.
 echo [INFO] Building "Astra Optimizer.exe" with PyInstaller...
 "%VENV_PY%" -m PyInstaller ^
     --noconfirm ^
     --clean ^
     --onefile ^
     --noconsole ^
+    --uac-admin ^
     --name "Astra Optimizer" ^
     --icon "%PROJECT_DIR%assets\icon.ico" ^
     --version-file "%WORK_DIR%\version_info.txt" ^

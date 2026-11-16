@@ -9,10 +9,8 @@ When a version is tagged on GitHub (for example `v1.2.0`), its section below bec
 ### Changed
 - **Fewer false antivirus alarms:** the exe now carries its own version details (product, description, version
   and copyright, shown under Properties > Details), and releases use a launcher compiled from PyInstaller's
-  source instead of the ready-made one shared by countless other programs. The exe also no longer demands
-  administrator rights in its manifest: Astra asks for them itself as it starts, with the same single UAC prompt.
-  Some antivirus engines' machine learning flagged v1.8.0 for looking like other unsigned PyInstaller apps;
-  nothing in what Astra does changed.
+  source instead of the ready-made one shared by countless other programs. Some antivirus engines' machine
+  learning flagged v1.8.0 for looking like other unsigned PyInstaller apps; nothing in Astra itself changed.
 
 ## v1.8.0 - 2026-11-16
 
