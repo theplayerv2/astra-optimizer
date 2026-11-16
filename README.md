@@ -128,6 +128,39 @@ Settings, the undo snapshot, your background picture and the log are stored in
 2. Exit from the tray icon, then delete `Astra Optimizer.exe`.
 3. Delete `C:\ProgramData\Astra Optimizer` to remove its settings and log.
 
+## Privacy policy
+
+Astra Optimizer has no accounts, telemetry, analytics or ads, and never sends your files, settings, logs or
+PC details anywhere. Everything it stores stays in `C:\ProgramData\Astra Optimizer` on your PC.
+
+It connects to the internet only for these, each described where you switch it on or press it:
+
+- **Update check:** asks GitHub's API for the latest release of this project at startup and every 12 hours.
+  Turn it off in Settings > App > **Check for updates**. An update is downloaded from this project's GitHub
+  releases only when you click **Update**.
+- **Ping:** the Ping tab measures latency to your router, Cloudflare (1.1.1.1), Google (8.8.8.8), four Amazon
+  Web Services regions and any host you type. While a game from your list runs, it pings Cloudflare every two
+  seconds for the session report. A ping carries no data about you.
+- **DNS test:** when you press **Run test** on the DNS tab, it looks up a list of popular website names (Google,
+  YouTube, Discord, Steam and others) at each DNS service shown.
+- **Links:** the GitHub page and the graphics driver pages open in your browser only when you click them.
+
+**Report a problem** saves a zip to your desktop and sends nothing: you decide whether to share it. Frame
+timing comes from Intel PresentMon running on your PC; nothing is sent.
+
+## Code signing policy
+
+Windows releases are to be signed with a free code signing certificate provided by
+[SignPath.io](https://about.signpath.io), issued by [SignPath Foundation](https://signpath.org). The application
+is in progress; releases up to v1.8.x are unsigned.
+
+- Only files built by this repository's GitHub Actions workflow, from the tagged source code, are signed.
+- **Committers and reviewers:** [theplayerv2](https://github.com/theplayerv2)
+- **Approvers:** [theplayerv2](https://github.com/theplayerv2)
+- Every release is approved by hand before it is signed.
+- Privacy: see the [privacy policy](#privacy-policy) above. Astra Optimizer changes Windows settings only when
+  you choose a mode or switch something on, shows what it will change first, and can undo every change.
+
 ## Credits
 
 Made by **theplayerv2** ([GitHub](https://github.com/theplayerv2)).
