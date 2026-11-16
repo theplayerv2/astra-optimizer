@@ -24,6 +24,8 @@ jobs:
 
       - name: Build Astra Optimizer.exe
         shell: cmd
+        env:
+          ASTRA_SOURCE_BOOTLOADER: "1"  # same as releases: own PyInstaller launcher
         run: build.bat --nopause
 
       - uses: actions/upload-artifact@v4

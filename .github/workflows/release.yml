@@ -25,6 +25,8 @@ jobs:
 
       - name: Build Astra Optimizer.exe
         shell: cmd
+        env:
+          ASTRA_SOURCE_BOOTLOADER: "1"  # own PyInstaller launcher: fewer antivirus false positives
         run: build.bat --nopause
 
       - name: Checksum and final notes

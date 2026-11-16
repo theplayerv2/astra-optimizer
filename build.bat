@@ -58,6 +58,16 @@ if errorlevel 1 goto :pipfail
 "%VENV_PY%" -m pip install --disable-pip-version-check --upgrade -r "%PROJECT_DIR%requirements.txt" "pyinstaller>=6.6"
 if errorlevel 1 goto :pipfail
 
+rem PyInstaller's ready-made launcher is shared by countless other exes, some of them malware, so
+rem antivirus machine learning tends to flag it. Releases (GitHub Actions sets ASTRA_SOURCE_BOOTLOADER=1)
+rem compile their own from PyInstaller's source; that needs a C compiler (Visual Studio Build Tools).
+if /i "%ASTRA_SOURCE_BOOTLOADER%"=="1" (
+    echo [INFO] Compiling PyInstaller's launcher from source...
+    set "PYINSTALLER_COMPILE_BOOTLOADER=1"
+    "%VENV_PY%" -m pip install --disable-pip-version-check --force-reinstall --no-deps --no-binary pyinstaller "pyinstaller>=6.6"
+    if errorlevel 1 goto :pipfail
+)
+
 rem ---------------------------------------------------------------
 rem 3. Syntax check, then compile the standalone executable
 rem ---------------------------------------------------------------
@@ -74,6 +84,13 @@ if errorlevel 1 (
     goto :fail
 )
 
+if not exist "%WORK_DIR%" mkdir "%WORK_DIR%"
+"%VENV_PY%" "%SOURCE%" --write-version "%WORK_DIR%\version_info.txt"
+if errorlevel 1 (
+    echo [ERROR] Could not write the exe's version details.
+    goto :fail
+)
+
 echo [INFO] Building "Astra Optimizer.exe" with PyInstaller...
 "%VENV_PY%" -m PyInstaller ^
     --noconfirm ^
@@ -83,6 +100,7 @@ echo [INFO] Building "Astra Optimizer.exe" with PyInstaller...
     --uac-admin ^
     --name "Astra Optimizer" ^
     --icon "%PROJECT_DIR%assets\icon.ico" ^
+    --version-file "%WORK_DIR%\version_info.txt" ^
     --add-data "%PROJECT_DIR%assets;assets" ^
     --collect-all customtkinter ^
     --hidden-import pystray._win32 ^
