@@ -4,6 +4,38 @@ What changed in each version of Astra Optimizer. The newest version is at the to
 
 When a version is tagged on GitHub (for example `v1.2.0`), its section below becomes the release notes.
 
+## v1.8.0 - 2026-11-16
+
+### Added
+- **What's holding your game back:** the overlay now says whether the game is **GPU-bound**, **CPU-bound** or
+  **Capped** (an FPS cap or V-Sync is setting the pace) right now, and each session report and benchmark shows how
+  much of the time each one set the pace, for example "Held back by: the GPU 78% of the time, the CPU 15%". When one
+  clearly dominates, the report says what would actually raise FPS: lower graphics settings when GPU-bound, Max FPS
+  and lighter CPU settings when CPU-bound. It comes from PresentMon's GPU and CPU busy times for every frame, so
+  nothing new runs in the game. A very steady frame rate counts as capped, since in-game limiters (like CS2's
+  menu cap) wait in a way that otherwise looks like CPU work. The overlay's right-click menu can hide it.
+
+- **Four more switches in Settings > Windows**, each putting back exactly what it replaced when switched off:
+  - **Mouse pointer speed 1:1:** the middle notch (6 of 11), where one count from your mouse moves the pointer one
+    pixel.
+  - **Turn off the Sticky Keys pop-ups:** the same shortcuts Max FPS turns off (Shift five times, holding right
+    Shift or Num Lock), as a lasting choice. Switching it here wins over a later Undo of a mode.
+  - **Stop sharing updates with other PCs:** Windows stops uploading update files to other PCs over your connection
+    (Delivery Optimization), which can raise ping. Updates still download.
+  - **Turn off Fast Startup:** shutting down fully restarts Windows and its drivers instead of half-hibernating.
+    Booting takes a few seconds longer.
+
+### Changed
+- **Appearance moved into Settings**, as a third page next to App and Windows. The side rail has one tab fewer.
+- The sliders' knob is a plain glowing dot; the four faint spikes around it are gone.
+
+### Fixed
+- After changing a game's video settings, the overlay's FPS went blank for a long while: the game starts drawing to
+  a new swap chain, and Astra kept watching the old one. It now follows the new one at once, and the session report
+  counts frames from both.
+- The DNS page's **Run test** button showed as a black box for a few seconds while Astra read your network adapter
+  (and while switching DNS). It now shows the busy look instead.
+
 ## v1.7.4 - 2026-11-16
 
 ### Added

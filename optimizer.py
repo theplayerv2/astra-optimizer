@@ -235,8 +235,8 @@ except Exception:  # pragma: no cover - depends on the build
 
 APP_NAME = "Astra Optimizer"
 LEGACY_APP_NAME = "Optimizer"  # pre-1.12 name: data folder and startup task are carried over
-APP_VERSION = "1.7.4"
-DISPLAY_VERSION = "v1.7.4"
+APP_VERSION = "1.8.0"
+DISPLAY_VERSION = "v1.8.0"
 CREDIT_NAME = "theplayerv2"
 UPDATE_REPO = "theplayerv2/astra-optimizer"
 CREDIT_URL = f"https://github.com/{UPDATE_REPO}"
@@ -478,6 +478,8 @@ SPI_GETTOGGLEKEYS, SPI_SETTOGGLEKEYS = 0x0034, 0x0035
 SPI_GETSTICKYKEYS, SPI_SETSTICKYKEYS = 0x003A, 0x003B
 ACCESS_HOTKEY_ON = 0x00000004  # SKF_/FKF_/TKF_HOTKEYACTIVE: the same bit in all three
 SPI_GETMOUSE, SPI_SETMOUSE = 0x0003, 0x0004
+SPI_GETMOUSESPEED, SPI_SETMOUSESPEED = 0x0070, 0x0071
+POINTER_SPEED_1TO1 = 10  # the middle notch (6 of 11): one mouse count moves the pointer one pixel
 MOUSE_ACCEL_DEFAULT = (6, 10, 1)  # threshold 1, threshold 2, acceleration: Enhance pointer precision as Windows ships
 # SET action -> matching GET action (used to snapshot the current value before changing it)
 SPI_GET_FOR_SET = {
@@ -989,6 +991,40 @@ def mouse_accel_set(values) -> bool:
     return bool(user32.SystemParametersInfoW(SPI_SETMOUSE, 0, ctypes.byref(data), SPIF_UPDATEINIFILE | SPIF_SENDCHANGE))
 
 
+def pointer_speed_get() -> int | None:
+    value = ctypes.c_int(0)
+    if not user32.SystemParametersInfoW(SPI_GETMOUSESPEED, 0, ctypes.byref(value), 0):
+        return None
+    return int(value.value)
+
+
+def pointer_notch(speed: int) -> int:
+    """Where Windows' 11-notch pointer speed slider sits for a speed of 1-20 (notch 6 is 10)."""
+    return 1 if speed <= 1 else min(11, speed // 2 + 1)
+
+
+def pointer_speed_set(speed: int) -> bool:
+    return bool(user32.SystemParametersInfoW(SPI_SETMOUSESPEED, 0, ctypes.c_void_p(int(speed)),
+                                             SPIF_UPDATEINIFILE | SPIF_SENDCHANGE))
+
+
+# Settings > Windows switches that are one registry value: key -> (hive, path, name, value when on,
+# value to fall back to when switched off with nothing saved (None: remove it, as Windows ships))
+WINSET_REG = {
+    # Settings > Windows Update > Delivery Optimization > "Allow downloads from other PCs" (0 = off)
+    "deliveryopt": ("HKU", r"S-1-5-20\Software\Microsoft\Windows\CurrentVersion\DeliveryOptimization\Settings",
+                    "DownloadMode", 0, None),
+    # Control Panel > Power Options > "Turn on fast startup"
+    "faststartup": ("HKLM", r"SYSTEM\CurrentControlSet\Control\Session Manager\Power", "HiberbootEnabled", 0, 1),
+}
+WINSET_MESSAGES = {  # (switched on, switched off)
+    "deliveryopt": ("Windows no longer shares update files with other PCs",
+                    "Windows shares update files with other PCs again, as it did before"),
+    "faststartup": ("Fast Startup is off: from your next shut down, Windows and its drivers start fresh",
+                    "Fast Startup is back on, as Windows had it"),
+}
+
+
 def access_shortcuts_on() -> list[str]:
     """Which of the three accessibility shortcuts are switched on right now."""
     on = []
@@ -1149,7 +1185,7 @@ class RunLog:
 # System tweaks engine
 # --------------------------------------------------------------------------------------
 
-HIVES = {"HKCU": winreg.HKEY_CURRENT_USER, "HKLM": winreg.HKEY_LOCAL_MACHINE}
+HIVES = {"HKCU": winreg.HKEY_CURRENT_USER, "HKLM": winreg.HKEY_LOCAL_MACHINE, "HKU": winreg.HKEY_USERS}
 
 # (label, SPI action or "animation", parameter style, category)
 VISUAL_SPI_EFFECTS = [
@@ -4899,6 +4935,65 @@ def presentmon_path() -> str | None:
     return path if os.path.isfile(path) else None
 
 
+BOUND_KINDS = ("gpu", "cpu", "cap")
+BOUND_BUSY = 0.80   # busy for this share of a frame's time: that part set the pace
+BOUND_IDLE = 0.60   # neither busy for this much: a frame cap or V-Sync set the pace
+STEADY_SPREAD = 0.04  # frame times within ~4% of each other over the last 60 frames: something is pacing them
+STEADY_FRAMES = 60
+
+
+class Steadiness:
+    """Rolling spread of the last STEADY_FRAMES frame times. A frame limiter holds frames to a fixed time;
+    a game that's CPU- or GPU-bound wanders with the scene."""
+
+    __slots__ = ("window", "total", "squares")
+
+    def __init__(self):
+        self.window: deque = deque()
+        self.total = self.squares = 0.0
+
+    def add(self, ms: float) -> bool:
+        self.window.append(ms)
+        self.total += ms
+        self.squares += ms * ms
+        if len(self.window) > STEADY_FRAMES:
+            old = self.window.popleft()
+            self.total -= old
+            self.squares -= old * old
+        n = len(self.window)
+        if n < STEADY_FRAMES // 2:
+            return False
+        mean = self.total / n
+        spread = max(0.0, self.squares / n - mean * mean) ** 0.5
+        return spread <= STEADY_SPREAD * mean
+
+
+def frame_bound(ms: float, gpu_busy: float | None, cpu_busy: float | None, steady: bool = False) -> str | None:
+    """What held one frame back, from PresentMon's GPU and CPU busy times: 'gpu', 'cpu' or 'cap'.
+    In-game limiters wait inside what PresentMon counts as CPU busy time, so a very steady frame rate
+    that the GPU isn't holding back counts as capped. CPU and GPU work overlap: a strong hint, not proof."""
+    if gpu_busy is None or cpu_busy is None or ms <= 0:
+        return None
+    gpu, cpu = gpu_busy / ms, cpu_busy / ms
+    if gpu >= BOUND_BUSY:
+        return "gpu"
+    if steady:
+        return "cap"
+    if cpu >= BOUND_BUSY:
+        return "cpu"
+    if max(gpu, cpu) < BOUND_IDLE:
+        return "cap"
+    return "gpu" if gpu >= cpu else "cpu"
+
+
+def bound_shares(totals: dict) -> dict | None:
+    """{'gpu': %, 'cpu': %, 'cap': %} of the classified time, or None with too little of it."""
+    total = sum(totals.get(k, 0.0) for k in BOUND_KINDS)
+    if total <= 0:
+        return None
+    return {k: 100.0 * totals.get(k, 0.0) / total for k in BOUND_KINDS}
+
+
 class FrameStats:
     """Streaming frame-time histogram (0.05 ms buckets up to 250 ms), so a long session costs
     a fixed ~40 KB however many frames it has."""
@@ -4910,13 +5005,16 @@ class FrameStats:
         self.buckets = [0] * (int(self.MAX_MS / self.RES) + 1)
         self.count = 0
         self.total_ms = 0.0
+        self.bound = {k: 0.0 for k in BOUND_KINDS}  # frame time spent GPU-bound, CPU-bound and capped
 
-    def add(self, ms: float) -> None:
+    def add(self, ms: float, bound: str | None = None) -> None:
         if not 0.05 <= ms <= 5000:  # ignore junk and the gap of a paused or alt-tabbed game
             return
         self.buckets[min(len(self.buckets) - 1, int(ms / self.RES))] += 1
         self.count += 1
         self.total_ms += ms
+        if bound is not None:
+            self.bound[bound] += ms
 
     def percentile(self, pct: float) -> float:
         """Frame time (ms) that pct% of frames are at or below."""
@@ -4933,13 +5031,19 @@ class FrameStats:
         median = self.percentile(50)
         threshold = max(2 * median, median + 8)  # a frame that took twice as long, and noticeably so
         first = min(len(self.buckets) - 1, int(threshold / self.RES) + 1)
-        return {"fps_avg": self.count * 1000.0 / self.total_ms, "fps_low1": 1000.0 / self.percentile(99),
-                "fps_spikes": sum(self.buckets[first:]), "fps_spike_ms": threshold, "frames": self.count}
+        result = {"fps_avg": self.count * 1000.0 / self.total_ms, "fps_low1": 1000.0 / self.percentile(99),
+                  "fps_spikes": sum(self.buckets[first:]), "fps_spike_ms": threshold, "frames": self.count}
+        if sum(self.bound.values()) >= self.total_ms * 0.5:  # most frames had GPU and CPU busy times
+            shares = bound_shares(self.bound)
+            result.update({f"bound_{k}": v for k, v in shares.items()})
+        return result
 
 
 class FrameCapture(threading.Thread):
-    """Runs PresentMon for one game (by exe name) and keeps one FrameStats per swap chain; the
-    busiest swap chain is the game itself (launchers and overlays draw far fewer frames)."""
+    """Runs PresentMon for one game (by exe name) and keeps one FrameStats per swap chain. The game is the
+    swap chain drawing the most frames right now (launchers and overlays draw far fewer); a game makes a new
+    one when its video settings change, so this follows the new one straight away and the session's own
+    FrameStats keeps counting across both."""
 
     def __init__(self, exe_name: str, command: list[str] | None = None):
         super().__init__(name=f"fps-{exe_name}", daemon=True)
@@ -4950,12 +5054,16 @@ class FrameCapture(threading.Thread):
                                    "--stop_existing_session", "--terminate_on_proc_exit", "--no_track_input"]
         self.stats: dict[tuple, FrameStats] = {}
         self.recent: dict[tuple, deque] = {}       # last few thousand frame times, for the live overlay
+        self.recent_bound: dict[tuple, deque] = {}  # (frame time, what held it back) for the last few seconds
         self.last_frame: dict[tuple, float] = {}
         self.error: str | None = None
         self.proc: subprocess.Popen | None = None
         self._stopping = False
         self.bench: FrameStats | None = None  # a benchmark's frames, while one runs
-        self.bench_key: tuple | None = None
+        self.main_key: tuple | None = None    # the swap chain that is the game right now
+        self.main = FrameStats()              # the game's frames for the whole session
+        self._steady: dict[tuple, Steadiness] = {}
+        self._pick_at = 0.0
 
     def run(self) -> None:
         import csv
@@ -4986,12 +5094,24 @@ class FrameCapture(threading.Thread):
                 if stats is None:
                     stats = self.stats[key] = FrameStats()
                     self.recent[key] = deque(maxlen=2400)
-                stats.add(ms)
+                    self.recent_bound[key] = deque(maxlen=1200)
+                    self._steady[key] = Steadiness()
+                steady = self._steady[key].add(ms)
+                bound = frame_bound(ms, _csv_float(row, columns.get("msgpubusy", columns.get("gpubusy"))),
+                                    _csv_float(row, columns.get("mscpubusy", columns.get("cpubusy"))), steady)
+                stats.add(ms, bound)
                 self.recent[key].append(ms)
-                bench = self.bench
-                if bench is not None and key == self.bench_key:
-                    bench.add(ms)
-                self.last_frame[key] = time.monotonic()
+                if bound is not None:
+                    self.recent_bound[key].append((ms, bound))
+                now = self.last_frame[key] = time.monotonic()
+                if key != self.main_key and now >= self._pick_at:
+                    self._pick_at = now + 0.5
+                    self.main_key = self._busiest_now(now)
+                if key == self.main_key:
+                    self.main.add(ms, bound)
+                    bench = self.bench
+                    if bench is not None:
+                        bench.add(ms, bound)
         except (OSError, ValueError):
             pass
         if not self.stats and not self._stopping:
@@ -5014,16 +5134,36 @@ class FrameCapture(threading.Thread):
             run_command([presentmon_path(), "--session_name", self.session_name, "--terminate_existing_session"],
                         timeout=10)
 
-    def summary(self) -> dict | None:
-        if not self.stats:
+    def _busiest_now(self, now: float) -> tuple | None:
+        """The swap chain that drew the most frames in the last second (among those drawing at all)."""
+        best, best_n = self.main_key, -1
+        for key, last in list(self.last_frame.items()):
+            if now - last > 1.0:
+                continue
+            total = n = 0
+            for ms in reversed(self.recent[key]):
+                total += ms
+                n += 1
+                if total >= 1000:
+                    break
+            if n > best_n:
+                best, best_n = key, n
+        return best
+
+    def _game_key(self) -> tuple | None:
+        """The game's swap chain, or None when it hasn't drawn for 2 s (minimised, loading)."""
+        key = self.main_key
+        if key is None or time.monotonic() - self.last_frame.get(key, 0) > 2.0:
             return None
-        return max(self.stats.values(), key=lambda st: st.count).summary()
+        return key
+
+    def summary(self) -> dict | None:
+        return self.main.summary() if self.main.count else None
 
     def start_bench(self) -> bool:
         """Start counting the game's frames on their own; False while it isn't drawing."""
         if self.live() is None:
             return False
-        self.bench_key = max(self.stats, key=lambda k: self.stats[k].count)
         self.bench = FrameStats()
         return True
 
@@ -5032,21 +5172,31 @@ class FrameCapture(threading.Thread):
         return bench.summary() if bench is not None else None
 
     def recent_frames(self, count: int) -> list[float]:
-        """The busiest swap chain's last frame times (ms), oldest first; empty when it's gone quiet."""
-        if not self.stats:
-            return []
-        key = max(self.stats, key=lambda k: self.stats[k].count)
-        if time.monotonic() - self.last_frame.get(key, 0) > 2.0:
-            return []
-        return list(self.recent.get(key) or [])[-count:]
+        """The game's last frame times (ms), oldest first; empty when it's gone quiet."""
+        key = self._game_key()
+        return list(self.recent.get(key) or [])[-count:] if key is not None else []
+
+    def live_bound(self) -> str | None:
+        """What mostly held the game back over the last second: 'gpu', 'cpu' or 'cap' (None when unknown)."""
+        key = self._game_key()
+        if key is None:
+            return None
+        totals = {k: 0.0 for k in BOUND_KINDS}
+        span = 0.0
+        for ms, bound in reversed(list(self.recent_bound.get(key) or [])):
+            totals[bound] += ms
+            span += ms
+            if span >= 1000:
+                break
+        if span < 250:  # too few classified frames to say
+            return None
+        return max(totals, key=totals.get)
 
     def live(self) -> tuple[float, float] | None:
         """(FPS over the last second, 1% low over the last ~2400 frames), or None when the game
         hasn't drawn anything for 2 s (minimised, loading)."""
-        if not self.stats:
-            return None
-        key = max(self.stats, key=lambda k: self.stats[k].count)
-        if time.monotonic() - self.last_frame.get(key, 0) > 2.0:
+        key = self._game_key()
+        if key is None:
             return None
         frames = list(self.recent.get(key) or [])
         if len(frames) < 10:
@@ -5060,6 +5210,15 @@ class FrameCapture(threading.Thread):
         ordered = sorted(frames)
         slow = ordered[min(len(ordered) - 1, int(len(ordered) * 0.99))]
         return count * 1000.0 / total, 1000.0 / slow if slow > 0 else 0.0
+
+
+def _csv_float(row: list, index: int | None) -> float | None:
+    if index is None or index >= len(row):
+        return None
+    try:
+        return float(row[index])
+    except ValueError:  # "NA"
+        return None
 
 
 def new_session(exe: str, name: str, now: float | None = None) -> dict:
@@ -5137,6 +5296,9 @@ def session_report_text(report: dict) -> str:
         lines.append(f"FPS: {report['fps_avg']:.0f} average, {report['fps_low1']:.0f} 1% low, "
                      + (f"{spikes} stutter spike{'s' if spikes != 1 else ''} over {report['fps_spike_ms']:.0f} ms"
                         if spikes else "no stutter spikes"))
+    held = bound_line(report)
+    if held:
+        lines.append(held)
     lines.append(f"CPU load: {report['cpu_avg']:.0f}% average, {report['cpu_peak']:.0f}% peak")
     if report.get("gpu_avg") is not None:
         lines.append(f"GPU load: {report['gpu_avg']:.0f}% average, {report['gpu_peak']:.0f}% peak")
@@ -5151,6 +5313,9 @@ def session_report_text(report: dict) -> str:
         loss_text = "none lost" if loss < 0.5 else f"{loss:.0f}% lost"
         lines.append(f"Ping to Cloudflare: {report['ping_avg']:.0f} ms average, {spike_text}, {loss_text}")
     notes = []
+    tip = bound_tip(report)
+    if tip:
+        notes.append(tip)
     if (report.get("temp_peak") or 0) >= 85:
         notes.append("Your GPU ran hot. Dusty fans or poor case airflow are the usual cause.")
     if (report.get("ping_loss") or 0) >= 2:
@@ -5158,6 +5323,36 @@ def session_report_text(report: dict) -> str:
     if notes:
         lines += [""] + notes
     return "\n".join(lines)
+
+
+BOUND_NAMES = {"gpu": "the GPU", "cpu": "the CPU", "cap": "an FPS cap or V-Sync"}
+BOUND_SHORT = {"gpu": "GPU-bound", "cpu": "CPU-bound", "cap": "Capped"}
+
+
+def bound_line(report: dict) -> str | None:
+    """'Held back by: the GPU 78% of the time, the CPU 15%, an FPS cap or V-Sync 7%'."""
+    shares = [(k, report.get(f"bound_{k}")) for k in BOUND_KINDS]
+    shares = sorted(((k, v) for k, v in shares if v is not None and v >= 1), key=lambda kv: -kv[1])
+    if not shares:
+        return None
+    first, rest = shares[0], shares[1:]
+    text = f"Held back by: {BOUND_NAMES[first[0]]} {first[1]:.0f}% of the time"
+    return text + "".join(f", {BOUND_NAMES[k]} {v:.0f}%" for k, v in rest)
+
+
+def bound_tip(report: dict) -> str | None:
+    """One sentence on what would raise FPS, when one part clearly set the pace."""
+    shares = {k: report.get(f"bound_{k}") for k in BOUND_KINDS}
+    if any(v is None for v in shares.values()):
+        return None
+    top = max(shares, key=shares.get)
+    if shares[top] < 60:
+        return None
+    return {"gpu": "Mostly GPU-bound: lower graphics settings or resolution scale for more FPS. Max FPS and other "
+                   "CPU tweaks change little here.",
+            "cpu": "Mostly CPU-bound: Max FPS, closing background apps and lowering CPU-heavy settings (view "
+                   "distance, crowds, physics) help most. Lower graphics settings won't add much.",
+            "cap": "Mostly capped: an FPS cap or V-Sync set the pace, so your PC had power to spare."}[top]
 
 
 def benchmark_summary(report: dict) -> str:
@@ -5197,9 +5392,9 @@ L_BRAND_GLYPH = (14, 9, 20)
 L_WINDOW_BUTTONS = {"min": (640, 6, 32, 24), "close": (674, 6, 32, 24)}
 L_RAIL_W = 64                                   # side tab rail
 CX = 78                                         # content column: x 78..706
-TAB_ORDER = ["boost", "tools", "privacy", "appearance", "settings", "about"]
+TAB_ORDER = ["boost", "tools", "privacy", "settings", "about"]  # Appearance is a page of Settings
 TAB_SPECS = {"boost": ("Boost", "comet"), "tools": ("Tools", "signal"), "privacy": ("Privacy", "shield"),
-             "appearance": ("Appearance", "contrast"), "settings": ("Settings", "sliders"), "about": ("About", "info")}
+             "settings": ("Settings", "sliders"), "about": ("About", "info")}
 L_ABOUT_ROWS = {"app": (78, 52, 628, 136), "credits": (78, 198, 628, 128), "info": (78, 336, 628, 130)}
 L_ABOUT_ICON = (100, 74, 92)          # x, y, size
 L_ABOUT_AVATAR = (100, 220, 84)
@@ -5208,7 +5403,8 @@ L_ABOUT_PROFILE = (546, 268, 140, 40)  # "GitHub page"
 L_ABOUT_LINK = (204, 286, 250, 20)    # the link text itself is clickable too
 L_ABOUT_UPDATE = (546, 74, 140, 40)   # "Check for updates" / "Download v…"
 L_RAIL_BOX = (6, 44, 60, 422)                  # floating glass box holding the tabs
-L_TABS = {key: (9, 52 + i * 69, 54, 58) for i, key in enumerate(TAB_ORDER)}
+L_TABS = {key: (9, 52 + i * 69, 54, 58) for i, key in enumerate(TAB_ORDER[:-1])}
+L_TABS[TAB_ORDER[-1]] = (9, 52 + 5 * 69, 54, 58)  # About stays at the foot of the rail
 # Boost tab
 L_PILLS = {"cpu": (78, 44, 104, 52), "gpu": (190, 44, 224, 52), "ram": (422, 44, 136, 52), "plan": (566, 44, 140, 52)}
 GPU_EXTRA_W = 118  # right-hand column of the GPU pill (VRAM, clock, power)
@@ -5274,7 +5470,9 @@ L_PING_COLS = {"name": 94, "latency": 322, "jitter": 410, "loss": 478, "bars": 5
 L_SETTING_ROWS = {key: (78, 96 + i * 53, 628, 48)
                   for i, key in enumerate(("tray", "autostart", "hotkey", "preview", "restore", "updates"))}
 L_SETTING_TEXT_Y = (6, 26)  # title and description offsets inside a row
-L_WINSET_ROWS = {key: (78, 96 + i * 53, 628, 48) for i, key in enumerate(("mouse", "startkey"))}  # Windows page
+L_WINSET_ROWS = {key: (78, 96 + i * 53, 628, 48)  # Windows page
+                 for i, key in enumerate(("mouse", "pointer", "sticky", "startkey", "deliveryopt", "faststartup"))}
+WINSET_ADMIN = {"deliveryopt", "faststartup"}
 L_TOGGLE = (44, 24)
 L_FOLDER_ROW = (78, 416, 628, 46)
 L_SETTING_BUTTONS = {"backup": (386, 420, 92, 38), "restore": (486, 420, 92, 38), "folder": (586, 420, 104, 38)}
@@ -5290,8 +5488,8 @@ L_PRIV_ALL = (78 + 628 - 16 - 120, 416 + 4, 120, 38)
 L_LOOK_RESET = (586, 50, 120, 36)
 L_LOOK_ROWS = {"background": (78, 100, 628, 88), "adjust": (78, 198, 628, 136), "motion": (78, 344, 628, 122)}
 L_SEGMENTS = {"bg": (386, 112, 300, 32), "motion": (326, 358, 360, 32), "tool": (78, 50, 424, 34),
-              "set": (78, 50, 220, 34)}
-SETTING_PAGES = [("app", "App"), ("windows", "Windows")]
+              "set": (78, 50, 330, 34)}
+SETTING_PAGES = [("app", "App"), ("windows", "Windows"), ("appearance", "Appearance")]
 L_LOOK_IMAGE_BTN = (98, 146, 140, 30)
 L_LOOK_HINT_Y = 161
 L_SLIDERS = {"blur": (228, 222, 370), "dim": (228, 251, 370), "glass": (228, 280, 370),
@@ -5342,6 +5540,14 @@ SETTING_TEXT = {
     # Windows page
     "mouse": ("Turn off mouse acceleration",
               "Turns off Windows' Enhance pointer precision, so aim feels the same at any mouse speed."),
+    "pointer": ("Mouse pointer speed 1:1",
+                "The middle notch (6 of 11), where one count from your mouse moves the pointer one pixel."),
+    "sticky": ("Turn off the Sticky Keys pop-ups",
+               "Shift five times, or holding right Shift or Num Lock, won't open a dialog mid-game."),
+    "deliveryopt": ("Stop sharing updates with other PCs",
+                    "Windows stops uploading update files to other PCs, which can raise ping. Updates still come."),
+    "faststartup": ("Turn off Fast Startup",
+                    "Shut down fully restarts Windows and its drivers. Booting takes a few seconds longer."),
     "startkey": ("Block the Start menu key in games", "Off. The Windows key opens Start as usual, even in games."),
 }
 
@@ -5934,7 +6140,7 @@ class GalaxyPainter:
     SLIDER_MARGIN = 18
 
     def slider_image(self, w: int, frac: float, state: str):
-        """Hairline track whose filled part is a comet tail ending in a flare star (the knob).
+        """Hairline track whose filled part is a comet tail ending in a glowing dot (the knob).
         Built from cached pieces so it can be redrawn on every mouse move.
         state: normal | hover | drag | disabled. Returns (image, margin)."""
         m, h = self.px(self.SLIDER_MARGIN), max(2, self.px(4))
@@ -5963,11 +6169,7 @@ class GalaxyPainter:
         big = Image.new("RGBA", (size * SUPERSAMPLE, size * SUPERSAMPLE), (0, 0, 0, 0))
         d = ImageDraw.Draw(big)
         c = size * SUPERSAMPLE / 2
-        core = (5.6 if state == "drag" else 5.0) * self.scale * SUPERSAMPLE
-        arm = (13.0 if active else 10.0) * self.scale * SUPERSAMPLE
-        lw = max(1, int(round(1.4 * self.scale * SUPERSAMPLE)))
-        d.line((c - arm, c, c + arm, c), fill=rgba(STARLIGHT, 190), width=lw)
-        d.line((c, c - arm, c, c + arm), fill=rgba(STARLIGHT, 190), width=lw)
+        core = {"drag": 6.4, "hover": 5.8}.get(state, 5.0) * self.scale * SUPERSAMPLE  # grows a little when touched
         d.ellipse((c - core, c - core, c + core, c + core), fill=rgba(STARLIGHT))
         star = big.resize((size, size), Image.Resampling.LANCZOS)
         halo = star.filter(ImageFilter.GaussianBlur(self.px(4.5 if active else 3)))
@@ -6202,10 +6404,11 @@ def push_layered(hwnd: int, image: Image.Image, x: int, y: int) -> bool:
         _ov_api.ReleaseDC(None, screen)
 
 
-OVERLAY_DEFAULTS = {"bg": "glass", "size": "small", "low": True, "graph": True, "gpu": True, "cpu": True,
+OVERLAY_DEFAULTS = {"bg": "glass", "size": "small", "low": True, "graph": True, "limit": True, "gpu": True, "cpu": True,
                     "ping": True, "locked": False}
 OVERLAY_BACKGROUNDS = [("clear", "Clear"), ("glass", "Glass"), ("solid", "Solid")]
-OVERLAY_ITEMS = [("low", "1% low"), ("graph", "Frame-time graph"), ("gpu", "GPU"), ("cpu", "CPU"), ("ping", "Ping")]
+OVERLAY_ITEMS = [("low", "1% low"), ("graph", "Frame-time graph"), ("limit", "Bottleneck (GPU / CPU / capped)"),
+                 ("gpu", "GPU"), ("cpu", "CPU"), ("ping", "Ping")]
 
 
 def _overlay_font(size: int, variation: bytes):
@@ -6252,6 +6455,9 @@ class OverlayRenderer:
         if st["low"]:
             out.append(("pair", "–" if low is None else f"{low:.0f}", "low", "000",
                         low is not None and fps is not None and low < fps * 0.5))
+        if st["limit"]:
+            bound = d.get("limit")
+            out.append(("text", BOUND_SHORT.get(bound, "–"), "", "CPU-bound", False))
         if st["gpu"]:
             load, temp = d.get("gpu_load"), d.get("gpu_temp")
             out.append(("pair", "–" if load is None else f"{load:.0f}%", "gpu", "00%", False))
@@ -7148,7 +7354,7 @@ class OptimizerApp(ctk.CTk):
 
         self.backdrops = {"boost": boost, "tools:checkup": checkup, "tools:ping": tools,"tools:games": games, "tools:startup": startup,
                           "tools:cleanup": cleanup, "tools:dns": dns, "tools:monitor": monitor,
-                          "appearance": appearance, "settings:app": settings, "settings:windows": settings_windows,
+                          "settings:appearance": appearance, "settings:app": settings, "settings:windows": settings_windows,
                           "privacy": privacy, "about": self._about_backdrop(base, rows)}
         for img in self.backdrops.values():
             # Hairline window edge (the native frame is gone).
@@ -7475,6 +7681,9 @@ class OptimizerApp(ctk.CTk):
                                                      fill=TEXT_MID, tags=winset)
             self._set_setting_desc(key, desc)
         self._refresh_startkey_row()
+        if not self.admin:
+            for key in WINSET_ADMIN:
+                self._set_setting_desc(key, "Needs administrator rights - restart the app and accept UAC.")
 
         # ---- Privacy tab ----
         pv = ("ui", "tab-privacy")
@@ -7532,10 +7741,7 @@ class OptimizerApp(ctk.CTk):
             c.create_text(px(x + 122), px(ry - 1), anchor="nw", text=value, font=font, fill=TEXT_HI, tags=ab)
 
         # ---- Appearance tab ----
-        look = ("ui", "tab-appearance")
-        c.create_text(px(CX), px(52), anchor="nw", text="Appearance", font=self.f_title, fill=TEXT_HI, tags=look)
-        c.create_text(px(CX), px(74), anchor="nw", font=self.f_purpose, fill=TEXT_MID, tags=look,
-                      text="Changes preview live and are saved on this PC.")
+        look = ("ui", "tab-settings", "spage-appearance")
         x, y, w, h = L_LOOK_RESET
         self.t_buttons["reset"] = c.create_text(px(x + w / 2), px(y + h / 2), text="Reset", font=self.f_ghost,
                                                 fill=TEXT_HI, tags=look)
@@ -7931,10 +8137,12 @@ class OptimizerApp(ctk.CTk):
                 c.itemconfigure("dns-restore", state="hidden")
         for key, item in self.t_tabs.items():
             c.itemconfigure(item, fill=TEXT_HI if key == self.tab else TEXT_MID)
-        if self.tab == "appearance" and self.look["background"] != "image":
-            c.itemconfigure("look-image", state="hidden")
         if self.tab == "settings":
-            c.itemconfigure("spage-windows" if self.settings_page == "app" else "spage-app", state="hidden")
+            for page, _label in SETTING_PAGES:
+                if page != self.settings_page:
+                    c.itemconfigure(f"spage-{page}", state="hidden")
+        if not self._look_page() or self.look["background"] != "image":
+            c.itemconfigure("look-image", state="hidden")
         if self.protection is not False or not self.admin:
             c.itemconfigure("protect-btn", state="hidden")
 
@@ -7968,7 +8176,7 @@ class OptimizerApp(ctk.CTk):
         if kind == "card":
             return self.tab == "boost" and not self.busy
         if kind == "look":
-            return self.tab == "appearance"
+            return self._look_page()
         if kind == "set":
             if self.tab != "settings":
                 return False
@@ -7976,16 +8184,21 @@ class OptimizerApp(ctk.CTk):
                 return pystray is not None
             if key in ("autostart", "restore"):
                 return self.admin and not (key == "autostart" and self._autostart_pending)
+            if key in WINSET_ADMIN:
+                return self.admin
             return True
         if kind == "seg":
-            return self.tab == ("tools" if key.startswith("tool:") else "settings" if key.startswith("set:")
-                                else "appearance")
+            if key.startswith("tool:"):
+                return self.tab == "tools"
+            if key.startswith("set:"):
+                return self.tab == "settings"
+            return self._look_page()
         if kind == "slider":
-            return self.tab == "appearance" and (key in GLOBAL_SLIDERS or self.look["background"] != "black")
+            return self._look_page() and (key in GLOBAL_SLIDERS or self.look["background"] != "black")
         if key == "reset":
-            return self.tab == "appearance"
+            return self._look_page()
         if key == "image":
-            return self.tab == "appearance" and self.look["background"] == "image"
+            return self._look_page() and self.look["background"] == "image"
         if key in ("optimize", "defaults"):
             return self.tab == "boost" and self.admin and not self.busy
         tools_page = self.tool_page if self.tab == "tools" else None
@@ -8048,7 +8261,7 @@ class OptimizerApp(ctk.CTk):
     def _button_state(self, key: str) -> str:
         target = f"btn:{key}"
         if (key == "optimize" and self.busy) or (key == "ping" and self.ping_running) \
-                or (key == "clean" and self.clean_state != "idle") or (key == "dnstest" and self.dns_state == "testing") \
+                or (key == "clean" and self.clean_state != "idle") or (key == "dnstest" and self.dns_state != "idle") \
                 or (key == "checkup" and self.checkup_state == "running"):
             return "busy"
         if not self._enabled(target):
@@ -8206,7 +8419,8 @@ class OptimizerApp(ctk.CTk):
                 self._render_boost(scene)
             elif self.tab == "tools":
                 self._render_tools(scene)
-            elif self.tab == "appearance":
+            elif self._look_page():
+                self._render_segment(scene, "set", SETTING_PAGES)
                 self._render_look(scene)
             elif self.tab == "privacy":
                 tw, th = L_TOGGLE
@@ -8414,7 +8628,7 @@ class OptimizerApp(ctk.CTk):
         """Redraw one slider's own small layer - cheap enough for every mouse move."""
         x, cy, w = L_SLIDERS[key]
         target = f"slider:{key}"
-        if not self._enabled(target) and self.tab == "appearance":
+        if not self._enabled(target) and self._look_page():
             state = "disabled"
         elif self._slider_drag == key:
             state = "drag"
@@ -8520,6 +8734,14 @@ class OptimizerApp(ctk.CTk):
         if key == "mouse":
             values = mouse_accel_get()
             return values is not None and values[2] == 0
+        if key == "pointer":
+            return pointer_speed_get() == POINTER_SPEED_1TO1
+        if key == "sticky":
+            return not access_shortcuts_on()
+        if key in WINSET_REG:
+            hive, path, name, on_value, _off = WINSET_REG[key]
+            current = SystemTweaks.reg_read(hive, path, name)
+            return current is not None and current[0] == on_value
         return bool(self._setting(key))
 
     # ---------------- input ----------------
@@ -8642,7 +8864,11 @@ class OptimizerApp(ctk.CTk):
                 return "btn:report"
             if inside(L_ABOUT_PROFILE) or inside(L_ABOUT_LINK):
                 return "btn:profile"
-        elif self.tab == "appearance":
+        elif self._look_page():
+            x, y, w, h = L_SEGMENTS["set"]
+            if inside((x, y, w, h)):
+                index = min(len(SETTING_PAGES) - 1, max(0, int((lx - x) / (w / len(SETTING_PAGES)))))
+                return f"seg:set:{SETTING_PAGES[index][0]}"
             if inside(L_LOOK_RESET):
                 return "btn:reset"
             if self.look["background"] == "image" and inside(L_LOOK_IMAGE_BTN):
@@ -8694,7 +8920,7 @@ class OptimizerApp(ctk.CTk):
         if self._slider_drag is not None:
             self._slider_set(event.x)
             return
-        if self.tab == "appearance":
+        if self._look_page():
             target = self._hit(event.x, event.y)
             if target != self.hover and ((target or "").startswith("slider:")
                                          or (self.hover or "").startswith("slider:")):
@@ -8779,7 +9005,7 @@ class OptimizerApp(ctk.CTk):
             return
         if self.tab == "boost":
             self._cycle_profile(step)
-        elif self.tab == "appearance" and self.hover and self.hover.startswith("slider:") \
+        elif self._look_page() and self.hover and self.hover.startswith("slider:") \
                 and self._enabled(self.hover):
             key = self.hover.partition(":")[2]
             self._slider_apply(key, self._slider_value(key) + step)
@@ -8990,7 +9216,17 @@ class OptimizerApp(ctk.CTk):
         index = PROFILE_ORDER.index(self.profile)
         self._select_profile(PROFILE_ORDER[(index + step) % len(PROFILE_ORDER)])
 
+    def _look_page(self) -> bool:
+        """Appearance is the third page of the Settings tab."""
+        return self.tab == "settings" and self.settings_page == "appearance"
+
     def _switch_tab(self, key: str) -> None:
+        if key == "appearance":  # the old tab's name still leads to it
+            if self.tab == "settings":
+                self._switch_settings_page("appearance")
+                return
+            self.settings_page = "appearance"
+            key = "settings"
         if key == self.tab or self.dialog or key not in TAB_ORDER:
             return
         if self._typing():
@@ -9627,16 +9863,18 @@ class OptimizerApp(ctk.CTk):
         self._tray_refresh()
 
     def _overlay_data(self) -> dict:
-        live, frames = None, []
+        live, frames, bound = None, [], None
         for session in self.sessions_live.values():
             capture = session.get("capture")
             if capture is not None:
                 live = capture.live() or live
                 frames = capture.recent_frames(90) or frames
+                bound = capture.live_bound() or bound
         gpu = self._last_tel.get("gpu") or {}
         return {"fps": live[0] if live else None, "low": live[1] if live else None, "frames": frames,
                 "gpu_temp": gpu.get("temp"), "gpu_load": gpu.get("load"), "cpu": self._last_tel.get("cpu"),
-                "ping": self._last_ping if self.sessions_live else None, "banner": self._bench_banner()}
+                "ping": self._last_ping if self.sessions_live else None, "banner": self._bench_banner(),
+                "limit": bound}
 
     # ---------------- benchmark: a fixed 60 s FPS capture, saved to the game's history ----------------
 
@@ -10078,6 +10316,12 @@ class OptimizerApp(ctk.CTk):
                     self._emit("ok", "Mouse acceleration is back on (Enhance pointer precision)")
                 else:
                     self._emit("fail", "Windows didn't accept the mouse setting")
+        elif key == "pointer":
+            self._toggle_pointer()
+        elif key == "sticky":
+            self._toggle_sticky()
+        elif key in WINSET_REG:
+            self._toggle_winset_reg(key)
         elif key == "startkey":
             on = not self._setting("startkey")
             self._set_setting("startkey", on)
@@ -10108,6 +10352,88 @@ class OptimizerApp(ctk.CTk):
             threading.Thread(target=work, name="autostart", daemon=True).start()
         self.canvas.configure(cursor="hand2" if self._enabled(self.hover) else "")
         self._render()
+
+    # ---------------- Settings > Windows: each switch saves exactly what it replaces ----------------
+
+    def _winset_saved(self) -> dict:
+        saved = self.state_store.get("winset_saved")
+        return dict(saved) if isinstance(saved, dict) else {}
+
+    def _winset_save(self, key: str, value) -> None:
+        saved = self._winset_saved()
+        if value is None:
+            saved.pop(key, None)
+        else:
+            saved[key] = value
+        self.state_store.set("winset_saved", saved)
+
+    def _toggle_pointer(self) -> None:
+        current = pointer_speed_get()
+        if current is None:
+            self._emit("fail", "Windows wouldn't say what your pointer speed is")
+            return
+        if current != POINTER_SPEED_1TO1:
+            self._winset_save("pointer", current)
+            if pointer_speed_set(POINTER_SPEED_1TO1):
+                self._emit("ok", f"Pointer speed set to 1:1 (it was notch {pointer_notch(current)} of 11)")
+            else:
+                self._emit("fail", "Windows didn't accept the pointer speed")
+            return
+        saved = self._winset_saved().get("pointer")
+        if not isinstance(saved, int) or not 1 <= saved <= 20 or saved == POINTER_SPEED_1TO1:
+            self._emit("info", "Your pointer speed was already 1:1 before Astra changed anything, so there's "
+                               "nothing to put back. Change it in Windows' mouse settings if you like")
+            return
+        if pointer_speed_set(saved):
+            self._winset_save("pointer", None)
+            self._emit("ok", f"Pointer speed is back to notch {pointer_notch(saved)} of 11")
+        else:
+            self._emit("fail", "Windows didn't accept the pointer speed")
+
+    def _toggle_sticky(self) -> None:
+        tweaks = SystemTweaks(RunLog(lambda *_a: None), self.state_store)
+        tweaks.recording = False  # this switch keeps its own record, apart from a mode's undo
+        for which, *_rest in ACCESS_SHORTCUTS:
+            self.state_store.snapshot_discard(f"access:{which}")  # your choice here wins over a later Undo
+        on_now = access_shortcuts_on()
+        if on_now:
+            self._winset_save("sticky", on_now)
+            ok = all(tweaks.set_access_shortcut(which, False) for which in on_now)
+            self._emit("ok" if ok else "fail", "Sticky Keys, Filter Keys and Toggle Keys pop-ups are off" if ok
+                       else "Windows didn't accept every shortcut change")
+            return
+        saved = self._winset_saved().get("sticky")
+        back = [w for w in saved if w in ACCESS_BY_KEY] if isinstance(saved, list) and saved \
+            else [which for which, *_rest in ACCESS_SHORTCUTS]  # nothing saved: Windows' default, all three on
+        ok = all(tweaks.set_access_shortcut(which, True) for which in back)
+        if ok:
+            self._winset_save("sticky", None)
+        self._emit("ok" if ok else "fail", "The Sticky Keys shortcuts are back on" if ok
+                   else "Windows didn't accept every shortcut change")
+
+    def _toggle_winset_reg(self, key: str) -> None:
+        hive, path, name, on_value, off_value = WINSET_REG[key]
+        title = SETTING_TEXT[key][0]
+        current = SystemTweaks.reg_read(hive, path, name)
+        try:
+            if not (current is not None and current[0] == on_value):
+                self._winset_save(key, {"present": current is not None,
+                                        "value": current[0] if current else None,
+                                        "type": current[1] if current else winreg.REG_DWORD})
+                _reg_put(hive, path, name, on_value)
+                self._emit("ok", WINSET_MESSAGES[key][0])
+                return
+            saved = self._winset_saved().get(key)
+            if isinstance(saved, dict) and saved.get("present"):
+                _reg_put(hive, path, name, saved["value"], int(saved.get("type", winreg.REG_DWORD)))
+            elif isinstance(saved, dict) or off_value is None:
+                _reg_delete(hive, path, name)  # it wasn't there before: Windows decides again
+            else:
+                _reg_put(hive, path, name, off_value)
+            self._winset_save(key, None)
+            self._emit("ok", WINSET_MESSAGES[key][1])
+        except OSError as exc:
+            self._emit("fail", f"{title}: Windows refused the change ({exc.strerror or exc})")
 
     def _on_autostart_result(self, desired: bool, ok: bool, message: str) -> None:
         self._autostart_pending = False
