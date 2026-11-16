@@ -163,7 +163,8 @@ is in progress; releases up to v1.8.x are unsigned.
 
 ## Credits
 
-Made by **theplayerv2** ([GitHub](https://github.com/theplayerv2)).
+Made by **theplayerv2** ([GitHub](https://github.com/theplayerv2)), built with the help of
+[Claude](https://claude.ai) by Anthropic. Every release is tested and approved by hand before it's published.
 
 Built with Python, [customtkinter](https://github.com/TomSchimansky/CustomTkinter),
 [Pillow](https://python-pillow.org), [psutil](https://github.com/giampaolo/psutil),
