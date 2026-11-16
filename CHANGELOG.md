@@ -4,6 +4,27 @@ What changed in each version of Astra Optimizer. The newest version is at the to
 
 When a version is tagged on GitHub (for example `v1.2.0`), its section below becomes the release notes.
 
+## v1.7.4 - 2026-11-16
+
+### Added
+- **Settings has two pages:** **App** holds Astra's own settings, as before, and the new **Windows** page holds
+  Windows settings worth changing for games.
+- **Turn off mouse acceleration** (Settings > Windows): switches off Windows' Enhance pointer precision, so the pointer
+  moves the same distance however fast you move the mouse. Switching it back on restores your exact previous values.
+- **Block the Start menu key in games** (Settings > Windows, off by default): a lone Windows key press won't open
+  Start while a game from your list is the window in front, so a stray press can't throw you out mid-match.
+  Shortcuts still work: Win+D, Win+G, Win+Shift+S and the rest go through as normal, and Alt+Tab out of the game
+  and the key works as usual. Mark games in the Games tab's new **Start key off** column to limit it to those; with
+  none marked, it covers every game on your list. It runs in a tiny helper process that only exists while such a
+  game is open and adds about 0.03 ms to a key press.
+- **Max FPS turns off the Sticky Keys pop-up:** the shortcuts behind it (Shift five times, holding right Shift for
+  Filter Keys, holding Num Lock for Toggle Keys) are switched off, so they can't drop you to the desktop in the
+  middle of a game. If you actually use Sticky Keys, the feature itself stays on. Undo puts the shortcuts back
+  exactly as they were.
+
+### Changed
+- The Games list has a third switch column, and the Find games list's Add column moved to the right.
+
 ## v1.7.3 - 2026-11-16
 
 ### Improved

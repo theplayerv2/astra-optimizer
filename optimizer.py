@@ -36,6 +36,185 @@ from xml.sax.saxutils import escape as xml_escape
 if sys.platform != "win32":
     raise SystemExit("Astra Optimizer only runs on Windows.")
 
+# --------------------------------------------------------------------------------------
+# Start menu key guard: a helper process started as  Astra --winkey-guard <event> <astra pid> <game pids>
+# It runs on its own (no other Python threads it could wait behind), so a key spends ~0.04 ms in it.
+# --------------------------------------------------------------------------------------
+
+WH_KEYBOARD_LL = 13
+LLKHF_EXTENDED = 0x01
+LLKHF_INJECTED = 0x10
+LLKHF_UP = 0x80
+VK_LWIN, VK_RWIN = 0x5B, 0x5C
+WINKEY_GUARD_ARG = "--winkey-guard"
+WINKEY_HOOK_FAILED = 2  # the helper's exit code when Windows refuses the hook
+
+
+class KBDLLHOOKSTRUCT(ctypes.Structure):
+    _fields_ = [("vkCode", wintypes.DWORD), ("scanCode", wintypes.DWORD), ("flags", wintypes.DWORD),
+                ("time", wintypes.DWORD), ("dwExtraInfo", ctypes.c_size_t)]
+
+
+class WinKeyFilter:
+    """Decides, key by key, what reaches Windows while a marked game is in front. A Windows key press is held
+    back: pressed together with another key it's handed on just before that key, so Win+D and every other
+    shortcut work; released on its own it's dropped, so the Start menu doesn't open. A Windows key that Windows
+    saw go down always gets its release too, so it can't stick."""
+
+    def __init__(self, pids, foreground, replay):
+        self.pids = frozenset(pids)
+        self.foreground = foreground  # () -> pid of the window in front
+        self.replay = replay          # (windows keys, vk, scan, flags): send them, then that key, in order
+        self.held: set[int] = set()     # held back; Windows hasn't seen them yet
+        self.handed: set[int] = set()   # held back, then handed on for a shortcut
+        self.passed: set[int] = set()   # went down normally (no game in front)
+        self.blocked = 0
+
+    def swallow(self, vk: int, scan: int, flags: int) -> bool:
+        if flags & LLKHF_INJECTED:
+            return False  # ours (a handed-on shortcut) or another app's
+        up = flags & LLKHF_UP
+        if vk == VK_LWIN or vk == VK_RWIN:
+            if up:
+                if vk in self.held:
+                    self.held.discard(vk)
+                    self.blocked += 1
+                    return True  # a lone tap: Start stays shut
+                self.handed.discard(vk)
+                self.passed.discard(vk)
+                return False
+            if vk in self.held:
+                return True  # key repeat while held
+            if vk in self.handed or vk in self.passed:
+                return False
+            if self.foreground() in self.pids:
+                self.held.add(vk)
+                return True
+            self.passed.add(vk)
+            return False
+        if self.held and not up:
+            keys = sorted(self.held)
+            self.held.clear()
+            self.handed.update(keys)
+            self.replay(keys, vk, scan, flags)
+            return True  # sent again right after the Windows key, so the order is kept
+        return False
+
+
+class KEYBDINPUT(ctypes.Structure):
+    _fields_ = [("wVk", wintypes.WORD), ("wScan", wintypes.WORD), ("dwFlags", wintypes.DWORD),
+                ("time", wintypes.DWORD), ("dwExtraInfo", ctypes.c_size_t)]
+
+
+class INPUTUNION(ctypes.Union):
+    _fields_ = [("ki", KEYBDINPUT), ("pad", ctypes.c_byte * 32)]  # as large as MOUSEINPUT
+
+
+class INPUT(ctypes.Structure):
+    _fields_ = [("type", wintypes.DWORD), ("u", INPUTUNION)]
+
+
+_send_input = ctypes.WinDLL("user32", use_last_error=True).SendInput
+_send_input.argtypes = [wintypes.UINT, ctypes.POINTER(INPUT), ctypes.c_int]
+_send_input.restype = wintypes.UINT
+
+
+def winkey_replay(win_keys, vk: int, scan: int, flags: int) -> int:
+    """Press the held-back Windows key(s), then the key that came with them, as one uninterrupted batch."""
+    extended = 0x0001  # KEYEVENTF_EXTENDEDKEY
+    events = [INPUT(1, INPUTUNION(ki=KEYBDINPUT(w, w, extended, 0, 0))) for w in win_keys]
+    events.append(INPUT(1, INPUTUNION(ki=KEYBDINPUT(vk, scan, extended if flags & LLKHF_EXTENDED else 0, 0, 0))))
+    return int(_send_input(len(events), (INPUT * len(events))(*events), ctypes.sizeof(INPUT)))
+
+
+def winkey_guard_main(args: list[str]) -> int:
+    """Hold a low-level keyboard hook until Astra closes, every listed game has closed or Astra sets the
+    stop event. Only the Windows keys are ever looked at; every other key goes straight on."""
+    try:
+        event_name, astra_pid = args[0], int(args[1])
+        game_pids = [int(p) for p in args[2].split(",") if p]
+    except (IndexError, ValueError):
+        return 1
+    k32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    u32 = ctypes.WinDLL("user32", use_last_error=True)
+    hookproc = ctypes.WINFUNCTYPE(ctypes.c_ssize_t, ctypes.c_int, wintypes.WPARAM, wintypes.LPARAM)
+    k32.OpenProcess.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
+    k32.OpenProcess.restype = wintypes.HANDLE
+    k32.OpenEventW.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.LPCWSTR]
+    k32.OpenEventW.restype = wintypes.HANDLE
+    k32.CloseHandle.argtypes = [wintypes.HANDLE]
+    k32.GetCurrentProcess.restype = wintypes.HANDLE
+    k32.SetPriorityClass.argtypes = [wintypes.HANDLE, wintypes.DWORD]
+    k32.GetModuleHandleW.argtypes = [wintypes.LPCWSTR]
+    k32.GetModuleHandleW.restype = wintypes.HMODULE
+    u32.SetWindowsHookExW.argtypes = [ctypes.c_int, hookproc, wintypes.HINSTANCE, wintypes.DWORD]
+    u32.SetWindowsHookExW.restype = wintypes.HHOOK
+    u32.CallNextHookEx.argtypes = [wintypes.HHOOK, ctypes.c_int, wintypes.WPARAM, wintypes.LPARAM]
+    u32.CallNextHookEx.restype = ctypes.c_ssize_t
+    u32.UnhookWindowsHookEx.argtypes = [wintypes.HHOOK]
+    u32.MsgWaitForMultipleObjects.argtypes = [wintypes.DWORD, ctypes.POINTER(wintypes.HANDLE), wintypes.BOOL,
+                                              wintypes.DWORD, wintypes.DWORD]
+    u32.MsgWaitForMultipleObjects.restype = wintypes.DWORD
+    u32.PeekMessageW.argtypes = [ctypes.POINTER(wintypes.MSG), wintypes.HWND, wintypes.UINT, wintypes.UINT,
+                                 wintypes.UINT]
+    u32.GetForegroundWindow.restype = wintypes.HWND
+    u32.GetWindowThreadProcessId.argtypes = [wintypes.HWND, ctypes.POINTER(wintypes.DWORD)]
+
+
+    synchronize, infinite, qs_allinput, pm_remove, wm_quit = 0x00100000, 0xFFFFFFFF, 0x04FF, 0x0001, 0x0012
+    stop = k32.OpenEventW(synchronize, False, event_name)
+    astra = k32.OpenProcess(synchronize, False, astra_pid)
+    games = [h for h in (k32.OpenProcess(synchronize, False, pid) for pid in game_pids) if h]
+    if not (stop and astra and games):
+        return 1
+    k32.SetPriorityClass(k32.GetCurrentProcess(), 0x00000080)  # HIGH: a busy game can't make keys wait on us
+
+    def foreground() -> int:
+        hwnd = u32.GetForegroundWindow()
+        pid = wintypes.DWORD(0)
+        if hwnd:
+            u32.GetWindowThreadProcessId(hwnd, ctypes.byref(pid))
+        return int(pid.value)
+
+    keys = WinKeyFilter(game_pids, foreground, winkey_replay)
+
+    def on_key(code, wparam, lparam):
+        if code == 0 and lparam:
+            try:
+                kb = KBDLLHOOKSTRUCT.from_address(lparam)
+                if keys.swallow(kb.vkCode, kb.scanCode, kb.flags):
+                    return 1
+            except Exception:
+                pass
+        return u32.CallNextHookEx(None, code, wparam, lparam)
+
+    proc = hookproc(on_key)
+    hook = u32.SetWindowsHookExW(WH_KEYBOARD_LL, proc, k32.GetModuleHandleW(None), 0)
+    if not hook:
+        return WINKEY_HOOK_FAILED
+    msg = wintypes.MSG()
+    try:
+        while games:
+            waits = (wintypes.HANDLE * (2 + len(games)))(stop, astra, *games)
+            result = u32.MsgWaitForMultipleObjects(len(waits), waits, False, infinite, qs_allinput)
+            if result in (0, 1):  # told to stop, or Astra closed
+                break
+            if 2 <= result < len(waits):
+                k32.CloseHandle(games.pop(result - 2))
+                continue
+            if result != len(waits):
+                break  # WAIT_FAILED
+            while u32.PeekMessageW(ctypes.byref(msg), None, 0, 0, pm_remove):
+                if msg.message == wm_quit:
+                    games = []
+    finally:
+        u32.UnhookWindowsHookEx(hook)
+    return 0
+
+
+if __name__ == "__main__" and sys.argv[1:2] == [WINKEY_GUARD_ARG]:
+    sys.exit(winkey_guard_main(sys.argv[2:]))
+
 import tkinter as tk
 import tkinter.font as tkfont
 import winreg
@@ -56,8 +235,8 @@ except Exception:  # pragma: no cover - depends on the build
 
 APP_NAME = "Astra Optimizer"
 LEGACY_APP_NAME = "Optimizer"  # pre-1.12 name: data folder and startup task are carried over
-APP_VERSION = "1.7.3"
-DISPLAY_VERSION = "v1.7.3"
+APP_VERSION = "1.7.4"
+DISPLAY_VERSION = "v1.7.4"
 CREDIT_NAME = "theplayerv2"
 UPDATE_REPO = "theplayerv2/astra-optimizer"
 CREDIT_URL = f"https://github.com/{UPDATE_REPO}"
@@ -293,6 +472,13 @@ SPI_SETUIEFFECTS = 0x103F
 SPI_SETCLIENTAREAANIMATION = 0x1043
 SPI_SETFONTSMOOTHINGTYPE = 0x200B
 SPI_GETANIMATION = 0x0048
+# Accessibility shortcuts (Shift five times, hold right Shift, hold Num Lock)
+SPI_GETFILTERKEYS, SPI_SETFILTERKEYS = 0x0032, 0x0033
+SPI_GETTOGGLEKEYS, SPI_SETTOGGLEKEYS = 0x0034, 0x0035
+SPI_GETSTICKYKEYS, SPI_SETSTICKYKEYS = 0x003A, 0x003B
+ACCESS_HOTKEY_ON = 0x00000004  # SKF_/FKF_/TKF_HOTKEYACTIVE: the same bit in all three
+SPI_GETMOUSE, SPI_SETMOUSE = 0x0003, 0x0004
+MOUSE_ACCEL_DEFAULT = (6, 10, 1)  # threshold 1, threshold 2, acceleration: Enhance pointer precision as Windows ships
 # SET action -> matching GET action (used to snapshot the current value before changing it)
 SPI_GET_FOR_SET = {
     SPI_SETDRAGFULLWINDOWS: 0x0026,
@@ -757,6 +943,60 @@ def get_active_power_plan() -> tuple[str, str]:
         if match:
             return match.group(1).lower(), match.group(2).strip()
     return "", "Unknown"
+
+
+class STICKYKEYS(ctypes.Structure):
+    _fields_ = [("cbSize", wintypes.UINT), ("dwFlags", wintypes.DWORD)]
+
+
+class TOGGLEKEYS(ctypes.Structure):
+    _fields_ = [("cbSize", wintypes.UINT), ("dwFlags", wintypes.DWORD)]
+
+
+class FILTERKEYS(ctypes.Structure):
+    _fields_ = [("cbSize", wintypes.UINT), ("dwFlags", wintypes.DWORD), ("iWaitMSec", wintypes.DWORD),
+                ("iDelayMSec", wintypes.DWORD), ("iRepeatMSec", wintypes.DWORD), ("iBounceMSec", wintypes.DWORD)]
+
+
+# which, label, struct, get, set
+ACCESS_SHORTCUTS = [
+    ("sticky", "Sticky Keys shortcut (Shift five times)", STICKYKEYS, SPI_GETSTICKYKEYS, SPI_SETSTICKYKEYS),
+    ("filter", "Filter Keys shortcut (hold right Shift)", FILTERKEYS, SPI_GETFILTERKEYS, SPI_SETFILTERKEYS),
+    ("toggle", "Toggle Keys shortcut (hold Num Lock)", TOGGLEKEYS, SPI_GETTOGGLEKEYS, SPI_SETTOGGLEKEYS),
+]
+ACCESS_BY_KEY = {spec[0]: spec for spec in ACCESS_SHORTCUTS}
+
+
+def access_shortcut_get(which: str):
+    """The current STICKYKEYS/FILTERKEYS/TOGGLEKEYS settings, or None when Windows won't say."""
+    _which, _label, struct, get_action, _set = ACCESS_BY_KEY[which]
+    info = struct()
+    info.cbSize = ctypes.sizeof(struct)
+    ok = user32.SystemParametersInfoW(get_action, ctypes.sizeof(struct), ctypes.byref(info), 0)
+    return info if ok else None
+
+
+def mouse_accel_get() -> tuple[int, int, int] | None:
+    """(threshold 1, threshold 2, acceleration); acceleration 0 means Enhance pointer precision is off."""
+    values = (ctypes.c_int * 3)()
+    if not user32.SystemParametersInfoW(SPI_GETMOUSE, 0, ctypes.byref(values), 0):
+        return None
+    return tuple(int(v) for v in values)
+
+
+def mouse_accel_set(values) -> bool:
+    data = (ctypes.c_int * 3)(*values)
+    return bool(user32.SystemParametersInfoW(SPI_SETMOUSE, 0, ctypes.byref(data), SPIF_UPDATEINIFILE | SPIF_SENDCHANGE))
+
+
+def access_shortcuts_on() -> list[str]:
+    """Which of the three accessibility shortcuts are switched on right now."""
+    on = []
+    for which, *_rest in ACCESS_SHORTCUTS:
+        info = access_shortcut_get(which)
+        if info is not None and info.dwFlags & ACCESS_HOTKEY_ON:
+            on.append(which)
+    return on
 
 
 def foreground_pid() -> int:
@@ -1417,6 +1657,36 @@ class SystemTweaks:
         self.log.fail(f"{label}: SystemParametersInfo failed (error {ctypes.get_last_error()})")
         return False
 
+    def set_access_shortcut(self, which: str, active: bool) -> bool:
+        """Switch one accessibility shortcut on or off, leaving the feature itself and its timings alone."""
+        _which, label, struct, _get, set_action = ACCESS_BY_KEY[which]
+        info = access_shortcut_get(which)
+        if info is None:
+            self.log.fail(f"{label}: Windows wouldn't say how it's set (error {ctypes.get_last_error()})")
+            return False
+        current = bool(info.dwFlags & ACCESS_HOTKEY_ON)
+        shown = "on" if active else "off"
+        if current == active:
+            self.log.ok(f"{label}: already {shown}")
+            return True
+        key = f"access:{which}"
+        if self.recording and not self.state.snapshot_has(key):
+            self.state.snapshot_add(key, {"kind": "access", "which": which, "label": label, "value": current})
+        info.dwFlags = (info.dwFlags | ACCESS_HOTKEY_ON) if active else (info.dwFlags & ~ACCESS_HOTKEY_ON)
+        if self._spi(set_action, ctypes.sizeof(struct), ctypes.byref(info)):
+            self.log.ok(f"{label}: {shown}")
+            self.stats["changed"] += 1
+            return True
+        self.log.fail(f"{label}: SystemParametersInfo failed (error {ctypes.get_last_error()})")
+        return False
+
+    def disable_access_shortcuts(self) -> None:
+        for which, *_rest in ACCESS_SHORTCUTS:
+            self.set_access_shortcut(which, False)
+
+    def _undo_access(self, entry: dict) -> bool:
+        return self.set_access_shortcut(entry["which"], bool(entry["value"]))
+
     @staticmethod
     def broadcast_setting_change(area: str) -> None:
         result = ctypes.c_size_t(0)
@@ -1826,6 +2096,7 @@ class SystemTweaks:
             "power": ("Power plan", self._undo_power),
             "reg": ("Registry settings", self._undo_reg),
             "spi": ("Visual effects", self._undo_spi),
+            "access": ("Keyboard shortcuts", self._undo_access),
             "svc": ("Services", self._undo_service),
             "nvdrs": ("NVIDIA settings", self._undo_nvidia),
             "amd": ("AMD settings", self._undo_amd),
@@ -1920,6 +2191,13 @@ class SystemTweaks:
             lines.append(f"Pause until restart: {', '.join(running)}" if running
                          else "Background services: already paused")
             lines.append("Free RAM: trim background apps and clear the standby cache (Medal and your games are skipped)")
+            keys = access_shortcuts_on()
+            if keys:
+                names = {"sticky": "Sticky Keys", "filter": "Filter Keys", "toggle": "Toggle Keys"}
+                shown = [names[k] for k in keys]
+                listed = shown[0] if len(shown) == 1 else ", ".join(shown[:-1]) + " and " + shown[-1]
+                lines.append(f"{listed} shortcut{'s' if len(shown) > 1 else ''} off, "
+                             "so Shift can't pop up a dialog mid-game")
             if windowed_games_pending():
                 lines.append("Optimizations for windowed games and variable refresh rate on")
             nv = nvidia_pending("max")
@@ -2078,6 +2356,8 @@ class SystemTweaks:
         self.apply_gpu_driver("max")
         self.log.head("Network")
         self.flush_dns()
+        self.log.head("Keyboard shortcuts")
+        self.disable_access_shortcuts()
         self.log.head("Background services (suspended until reboot)")
         for name, label in SUSPEND_SERVICES:
             self.stop_service(name, label)
@@ -2459,7 +2739,7 @@ DEFAULT_SETTINGS = {"tray": True, "autostart": False, "hotkey": True, "custom_ho
                     "dns_original": None,
                     "restore_point": True, "restore_point_at": 0, "updates": True, "sessions": [],
                     "overlay": True, "overlay_pos": None, "overlay_style": None,
-                    "slow_background": False, "hotkeys": {}}
+                    "slow_background": False, "hotkeys": {}, "startkey": False}
 
 
 # --------------------------------------------------------------------------------------
@@ -2787,6 +3067,67 @@ class HotkeyThread(threading.Thread):
             user32.PostThreadMessageW(self.thread_id, WM_QUIT, 0, 0)
             if self.is_alive() and threading.current_thread() is not self:
                 self.join(1.0)  # its finally unregisters the key; wait so it can be taken again at once
+
+
+class WinKeyGuard:
+    """Keeps a lone Windows key press from opening Start while a marked game is the window in front.
+    The keyboard hook runs in a small helper process (see winkey_guard_main) that only exists while such a
+    game is running: inside Astra a key could wait ~5 ms behind its other threads."""
+
+    def __init__(self):
+        self._lock = threading.Lock()
+        self.pids: frozenset[int] = frozenset()
+        self.proc: subprocess.Popen | None = None
+        self._event = None
+        self._count = 0
+        self.failed = False
+
+    @property
+    def active(self) -> bool:
+        return self.proc is not None and self.proc.poll() is None
+
+    @staticmethod
+    def command(event_name: str, pids) -> list[str]:
+        own = [sys.executable] if getattr(sys, "frozen", False) else [sys.executable, os.path.abspath(__file__)]
+        return [*own, WINKEY_GUARD_ARG, event_name, str(os.getpid()), ",".join(str(p) for p in sorted(pids))]
+
+    def update(self, pids) -> None:
+        """Called by the game watcher with the running games that want the key blocked."""
+        pids = frozenset(pids)
+        with self._lock:
+            if pids == self.pids:
+                if self.proc is not None and self.proc.poll() == WINKEY_HOOK_FAILED:
+                    self.failed = True
+                return
+            self._end()
+            self.pids = pids
+            if not pids:
+                return
+            self._count += 1
+            name = f"Local\\AstraWinKeyGuard-{os.getpid()}-{self._count}"
+            self._event = kernel32.CreateEventW(None, True, False, name)
+            try:
+                self.proc = subprocess.Popen(self.command(name, pids), creationflags=CREATE_NO_WINDOW,
+                                             stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                                             stderr=subprocess.DEVNULL, close_fds=True)
+            except OSError:
+                self.proc, self.failed = None, True
+
+    def _end(self) -> None:
+        if self._event:
+            kernel32.SetEvent(self._event)
+        if self.proc is not None:
+            try:
+                self.proc.wait(2.0)
+            except subprocess.TimeoutExpired:
+                self.proc.kill()
+            self.proc = None
+        if self._event:
+            kernel32.CloseHandle(self._event)
+            self._event = None
+
+    def stop(self) -> None:
+        self.update(())
 
 
 def launch_command() -> tuple[str, str]:
@@ -3191,11 +3532,17 @@ class GameWatcher(threading.Thread):
         self.background = background or BackgroundApps(os.path.join(STATE_DIR, "background_apps.json"))
         self.slow_background = False
         self._slow_announced = False
+        self.winkey = WinKeyGuard()
+        self.winkey_enabled = False  # Settings > Windows > Block the Start menu key in games
+        self._winkey_paths: set[str] = set()
+        self._winkey_warned = False
 
     def set_games(self, games: list[dict]) -> None:
         table = {os.path.normcase(g["path"]): bool(g.get("priority", True)) for g in games}
+        winkey = {os.path.normcase(g["path"]) for g in games if g.get("winkey")}
         with self._lock:
             self._games = table
+            self._winkey_paths = winkey
         GAME_EXE_PATHS.clear()
         GAME_EXE_PATHS.update(table)
 
@@ -3238,6 +3585,17 @@ class GameWatcher(threading.Thread):
                 self.out_queue.put(("game-stop", pid, exe))
         self.running = seen
         self._update_background(bool(seen), extra)
+        self._update_winkey(seen)
+
+    def _update_winkey(self, seen: dict[int, str]) -> None:
+        with self._lock:
+            paths = set(self._winkey_paths) or set(self._games)  # none marked: every game on the list
+        on = self.winkey_enabled and not self.stop_event.is_set()
+        wanted = {pid for pid, exe in seen.items() if exe in paths} if on else set()
+        self.winkey.update(wanted)
+        if wanted and self.winkey.failed and not self._winkey_warned:
+            self._winkey_warned = True
+            self.out_queue.put(("winkey-failed",))
 
     def _update_background(self, playing: bool, extra: list) -> None:
         """Slow background apps while a game runs (new ones too: browsers keep starting processes),
@@ -3258,6 +3616,7 @@ class GameWatcher(threading.Thread):
     def stop(self) -> None:
         """Stop scanning and put background apps back straight away."""
         self.stop_event.set()
+        self.winkey.stop()
         with self.background._lock:
             self.background.closed = True
         self.background.restore()
@@ -4884,7 +5243,9 @@ MONITOR_SPECS = {"cpu": ("CPU load", "%"), "gpu": ("GPU load", "%"), "temp": ("G
 HISTORY_LEN = 240  # samples at 1.5 s = the last 6 minutes
 L_TABLE = (78, 100, 628, 312)
 L_GAME_ROW_Y0, L_GAME_ROW_H, GAME_ROWS = 134, 46, 6
-L_GAME_COLS = {"name": 94, "prio": 466, "fso": 566, "del": 664}
+L_GAME_COLS = {"name": 94, "prio": 366, "fso": 466, "win": 566, "del": 664}
+L_GAME_NAME_W = 258  # game name and its subtitle, left of the switches
+GAME_HEADS = {"prio": "HIGH PRIORITY", "fso": "FULLSCREEN OPT. OFF", "win": "START KEY OFF"}
 L_GAME_AUTO = (78, 424, 628, 42)
 L_GAME_SPLIT = 210   # the bottom row holds three switches: auto mode | overlay | background apps
 L_GAME_SPLIT2 = 414
@@ -4913,6 +5274,7 @@ L_PING_COLS = {"name": 94, "latency": 322, "jitter": 410, "loss": 478, "bars": 5
 L_SETTING_ROWS = {key: (78, 96 + i * 53, 628, 48)
                   for i, key in enumerate(("tray", "autostart", "hotkey", "preview", "restore", "updates"))}
 L_SETTING_TEXT_Y = (6, 26)  # title and description offsets inside a row
+L_WINSET_ROWS = {key: (78, 96 + i * 53, 628, 48) for i, key in enumerate(("mouse", "startkey"))}  # Windows page
 L_TOGGLE = (44, 24)
 L_FOLDER_ROW = (78, 416, 628, 46)
 L_SETTING_BUTTONS = {"backup": (386, 420, 92, 38), "restore": (486, 420, 92, 38), "folder": (586, 420, 104, 38)}
@@ -4927,7 +5289,9 @@ L_PRIV_ALL = (78 + 628 - 16 - 120, 416 + 4, 120, 38)
 # Appearance tab
 L_LOOK_RESET = (586, 50, 120, 36)
 L_LOOK_ROWS = {"background": (78, 100, 628, 88), "adjust": (78, 198, 628, 136), "motion": (78, 344, 628, 122)}
-L_SEGMENTS = {"bg": (386, 112, 300, 32), "motion": (326, 358, 360, 32), "tool": (78, 50, 424, 34)}
+L_SEGMENTS = {"bg": (386, 112, 300, 32), "motion": (326, 358, 360, 32), "tool": (78, 50, 424, 34),
+              "set": (78, 50, 220, 34)}
+SETTING_PAGES = [("app", "App"), ("windows", "Windows")]
 L_LOOK_IMAGE_BTN = (98, 146, 140, 30)
 L_LOOK_HINT_Y = 161
 L_SLIDERS = {"blur": (228, 222, 370), "dim": (228, 251, 370), "glass": (228, 280, 370),
@@ -4975,6 +5339,10 @@ SETTING_TEXT = {
     "preview": ("Preview and summary", "Lists what a mode will change, then what it did. Hotkey and tray skip it."),
     "restore": ("Restore point first", "Saves a Windows restore point before your first optimize each day."),
     "updates": ("Check for updates", "Asks GitHub for a newer version at startup. Nothing downloads on its own."),
+    # Windows page
+    "mouse": ("Turn off mouse acceleration",
+              "Turns off Windows' Enhance pointer precision, so aim feels the same at any mouse speed."),
+    "startkey": ("Block the Start menu key in games", "Off. The Windows key opens Start as usual, even in games."),
 }
 
 CARD_SPECS = [
@@ -6172,6 +6540,7 @@ class OptimizerApp(ctk.CTk):
         self._overlay: dict | None = None
         self._frost_cache: dict = {}
         self.tool_page = "checkup"
+        self.settings_page = "app"  # app | windows
         self.checkup_state = "idle"  # idle | running
         self.checkup: dict[str, dict] = {}
         self.checkup_at = 0.0
@@ -6756,6 +7125,8 @@ class OptimizerApp(ctk.CTk):
 
         settings = base.copy()
         rows(settings, [*L_SETTING_ROWS.values(), L_FOLDER_ROW])
+        settings_windows = base.copy()
+        rows(settings_windows, L_WINSET_ROWS.values())
         privacy = base.copy()
         rows(privacy, [*L_PRIV_ROWS.values(), L_PRIV_FOOT])
         appearance = base.copy()
@@ -6777,7 +7148,8 @@ class OptimizerApp(ctk.CTk):
 
         self.backdrops = {"boost": boost, "tools:checkup": checkup, "tools:ping": tools,"tools:games": games, "tools:startup": startup,
                           "tools:cleanup": cleanup, "tools:dns": dns, "tools:monitor": monitor,
-                          "appearance": appearance, "settings": settings, "privacy": privacy, "about": self._about_backdrop(base, rows)}
+                          "appearance": appearance, "settings:app": settings, "settings:windows": settings_windows,
+                          "privacy": privacy, "about": self._about_backdrop(base, rows)}
         for img in self.backdrops.values():
             # Hairline window edge (the native frame is gone).
             self._hairline(img, 0, 0, WINDOW_W, 1 / self.scale, 22)
@@ -6815,7 +7187,8 @@ class OptimizerApp(ctk.CTk):
                 L_SEGMENTS["tool"], L_GAME_AUTO, *L_CLEAN_ROWS.values(), L_CLEAN_BAR, L_GAME_FIND, L_GAME_ADD, L_DNS_BAR,
                 *L_CHECK_SLOTS,
                 *L_MONITOR.values(),
-                *L_SETTING_ROWS.values(), L_FOLDER_ROW, *L_LOOK_ROWS.values(), L_LOOK_RESET,
+                *L_SETTING_ROWS.values(), L_FOLDER_ROW, *L_WINSET_ROWS.values(), L_SEGMENTS["set"],
+                *L_LOOK_ROWS.values(), L_LOOK_RESET,
                 *L_PRIV_ROWS.values(), L_PRIV_FOOT]
 
     def _bg_path(self) -> str:
@@ -7056,10 +7429,7 @@ class OptimizerApp(ctk.CTk):
                                                 fill=TEXT_HI, tags=tools)
         self._build_tool_pages()
 
-        # ---- Settings tab ----
-        c.create_text(px(CX), px(52), anchor="nw", text="Settings", font=self.f_title, fill=TEXT_HI, tags=settings)
-        c.create_text(px(CX), px(74), anchor="nw", font=self.f_purpose, fill=TEXT_MID, tags=settings,
-                      text="Saved on this PC and applied straight away.")
+        # ---- Settings tab: App page (the Windows page and the page switcher follow) ----
         self.t_setting_desc, self.t_setting_title = {}, {}
         for key, (x, y, w, h) in L_SETTING_ROWS.items():
             title, desc = SETTING_TEXT[key]
@@ -7089,6 +7459,22 @@ class OptimizerApp(ctk.CTk):
         for key, (bx, by, bw, bh) in L_SETTING_BUTTONS.items():
             self.t_buttons[key] = c.create_text(px(bx + bw / 2), px(by + bh / 2), text=SETTING_BUTTON_TEXT[key],
                                                 font=self.f_ghost, fill=TEXT_HI, tags=settings)
+        c.addtag_withtag("spage-app", "tab-settings")  # everything so far belongs to the App page
+        sx, sy, sw, sh = L_SEGMENTS["set"]
+        step = sw / len(SETTING_PAGES)
+        for i, (key, label) in enumerate(SETTING_PAGES):
+            self.t_seg[("set", key)] = c.create_text(px(sx + step * (i + 0.5)), px(sy + sh / 2), text=label,
+                                                     font=self.f_ghost_small, fill=TEXT_MID, tags=settings)
+        winset = (*settings, "spage-windows")
+        for key, (x, y, w, h) in L_WINSET_ROWS.items():
+            title, desc = SETTING_TEXT[key]
+            ty, dy = L_SETTING_TEXT_Y
+            self.t_setting_title[key] = c.create_text(px(x + 20), px(y + ty), anchor="nw", text=title,
+                                                      font=self.f_title, fill=TEXT_HI, tags=winset)
+            self.t_setting_desc[key] = c.create_text(px(x + 20), px(y + dy), anchor="nw", font=self.f_desc,
+                                                     fill=TEXT_MID, tags=winset)
+            self._set_setting_desc(key, desc)
+        self._refresh_startkey_row()
 
         # ---- Privacy tab ----
         pv = ("ui", "tab-privacy")
@@ -7225,7 +7611,7 @@ class OptimizerApp(ctk.CTk):
                                                     font=self.f_ghost, fill=TEXT_HI, tags=g)
         self.t_game_heads = {"name": c.create_text(px(L_GAME_COLS["name"]), px(head_y), anchor="nw", text="GAME",
                                                    font=self.f_label, fill=ASH, tags=g)}
-        for col, label in (("prio", "HIGH PRIORITY"), ("fso", "FULLSCREEN OPT. OFF")):
+        for col, label in GAME_HEADS.items():
             self.t_game_heads[col] = c.create_text(px(L_GAME_COLS[col] + 22), px(head_y), anchor="n", text=label,
                                                    font=self.f_label, fill=ASH, tags=g)
         for col, cx in L_HIST_COLS.items():
@@ -7496,10 +7882,20 @@ class OptimizerApp(ctk.CTk):
         return "break"
 
     def _set_setting_desc(self, key: str, text: str, color: str = TEXT_MID) -> None:
-        x, _y, w, _h = L_SETTING_ROWS[key]
+        x, _y, w, _h = L_SETTING_ROWS.get(key) or L_WINSET_ROWS[key]
         room = w - 120 - (L_PROTECT_BUTTON[2] + 14 if key == "restore" and self.protection is False else 0) \
             - (L_HOTKEYS_BUTTON[2] + 14 if key == "hotkey" else 0)
         self.canvas.itemconfigure(self.t_setting_desc[key], text=self._fit(text, self.f_desc, room), fill=color)
+
+    def _refresh_startkey_row(self) -> None:
+        if not self._setting("startkey"):
+            text = SETTING_TEXT["startkey"][1]
+        else:
+            marked = sum(1 for g in self.games if g.get("winkey"))
+            where = (f"in your {marked} marked game{'s' if marked != 1 else ''}" if marked
+                     else "in any game on your list")
+            text = f"A lone press won't open Start {where}. Win+D and other shortcuts still work."
+        self._set_setting_desc("startkey", text)
 
     def _refresh_restore_row(self) -> None:
         if not self.admin:
@@ -7537,6 +7933,8 @@ class OptimizerApp(ctk.CTk):
             c.itemconfigure(item, fill=TEXT_HI if key == self.tab else TEXT_MID)
         if self.tab == "appearance" and self.look["background"] != "image":
             c.itemconfigure("look-image", state="hidden")
+        if self.tab == "settings":
+            c.itemconfigure("spage-windows" if self.settings_page == "app" else "spage-app", state="hidden")
         if self.protection is not False or not self.admin:
             c.itemconfigure("protect-btn", state="hidden")
 
@@ -7580,7 +7978,8 @@ class OptimizerApp(ctk.CTk):
                 return self.admin and not (key == "autostart" and self._autostart_pending)
             return True
         if kind == "seg":
-            return self.tab == ("tools" if key.startswith("tool:") else "appearance")
+            return self.tab == ("tools" if key.startswith("tool:") else "settings" if key.startswith("set:")
+                                else "appearance")
         if kind == "slider":
             return self.tab == "appearance" and (key in GLOBAL_SLIDERS or self.look["background"] != "black")
         if key == "reset":
@@ -7679,7 +8078,8 @@ class OptimizerApp(ctk.CTk):
     def _seg_targets(self) -> dict[str, float]:
         return {"bg": float([k for k, _ in BG_KINDS].index(self.look["background"])),
                 "motion": float([k for k, _ in MOTION_MODES].index(self.look["motion"])),
-                "tool": float([k for k, _ in TOOL_PAGES].index(self.tool_page))}
+                "tool": float([k for k, _ in TOOL_PAGES].index(self.tool_page)),
+                "set": float([k for k, _ in SETTING_PAGES].index(self.settings_page))}
 
     def _targets(self) -> tuple[dict, float]:
         cards = {}
@@ -7828,7 +8228,9 @@ class OptimizerApp(ctk.CTk):
                 self.canvas.itemconfigure(self.t_about_link,
                                           fill=TEXT_HI if self.hover == "btn:profile" else SILVER)
             else:
-                for key, (x, y, w, h) in L_SETTING_ROWS.items():
+                self._render_segment(scene, "set", SETTING_PAGES)
+                page_rows = L_SETTING_ROWS if self.settings_page == "app" else L_WINSET_ROWS
+                for key, (x, y, w, h) in page_rows.items():
                     target = f"set:{key}"
                     if not self._enabled(target):
                         state = "disabled"
@@ -7838,11 +8240,12 @@ class OptimizerApp(ctk.CTk):
                     tw, th = L_TOGGLE
                     img = self._cached(("toggle", on, state), lambda: self.painter.toggle(px(tw), px(th), on, state))
                     paste_layer(scene, img, px(x + w - 20 - tw), px(y + (h - th) / 2))
-                for key, rect in L_SETTING_BUTTONS.items():
-                    self._render_ghost(scene, key, rect)
-                if self.protection is False and self.admin:
-                    self._render_ghost(scene, "protect", L_PROTECT_BUTTON)
-                self._render_ghost(scene, "hotkeys", L_HOTKEYS_BUTTON)
+                if self.settings_page == "app":
+                    for key, rect in L_SETTING_BUTTONS.items():
+                        self._render_ghost(scene, key, rect)
+                    if self.protection is False and self.admin:
+                        self._render_ghost(scene, "protect", L_PROTECT_BUTTON)
+                    self._render_ghost(scene, "hotkeys", L_HOTKEYS_BUTTON)
 
             for key, (x, y, w, h) in L_WINDOW_BUTTONS.items():
                 target = f"win:{key}"
@@ -7869,6 +8272,8 @@ class OptimizerApp(ctk.CTk):
                                       fill=VOID if lit else ("#FFFFFF" if hovered else TEXT_MID))
 
     def _backdrop_key(self) -> str:
+        if self.tab == "settings":
+            return f"settings:{self.settings_page}"
         return f"tools:{self.tool_page}" if self.tab == "tools" else self.tab
 
     def _render_tools(self, scene: Image.Image) -> None:
@@ -7935,7 +8340,7 @@ class OptimizerApp(ctk.CTk):
             items = self.game_finder.get("items", [])
             for i in range(min(GAME_ROWS, len(items) - self.game_offset)):
                 index = self.game_offset + i
-                toggle(f"find:{index}", items[index]["pick"], L_GAME_COLS["prio"], L_GAME_ROW_Y0 + i * L_GAME_ROW_H + 10)
+                toggle(f"find:{index}", items[index]["pick"], L_GAME_COLS["win"], L_GAME_ROW_Y0 + i * L_GAME_ROW_H + 10)
             ax, ay, aw, ah = L_GAME_AUTO
             toggle("game:auto", bool(self._setting("game_auto")), ax + 18, ay + (ah - th) / 2)
             toggle("game:overlay", bool(self._setting("overlay")), ax + L_GAME_SPLIT, ay + (ah - th) / 2)
@@ -7967,6 +8372,7 @@ class OptimizerApp(ctk.CTk):
                 game, ry = self.games[index], L_GAME_ROW_Y0 + i * L_GAME_ROW_H
                 toggle(f"game:prio:{index}", bool(game.get("priority", True)), L_GAME_COLS["prio"], ry + 10)
                 toggle(f"game:fso:{index}", bool(game.get("_fso")), L_GAME_COLS["fso"], ry + 10)
+                toggle(f"game:win:{index}", bool(game.get("winkey")), L_GAME_COLS["win"], ry + 10)
                 target = f"game:del:{index}"
                 state = "hover" if self.hover == target else "normal"
                 img = self._cached(("win", "close-row", state), lambda: self.painter.window_button(
@@ -8111,6 +8517,9 @@ class OptimizerApp(ctk.CTk):
             return self.hotkey is not None
         if key == "autostart":
             return bool(self._autostart_desired if self._autostart_pending else self._setting("autostart"))
+        if key == "mouse":
+            values = mouse_accel_get()
+            return values is not None and values[2] == 0
         return bool(self._setting(key))
 
     # ---------------- input ----------------
@@ -8199,9 +8608,11 @@ class OptimizerApp(ctk.CTk):
                         return f"game:prio:{index}"
                     if inside((L_GAME_COLS["fso"] - 8, ry + 4, 60, 36)):
                         return f"game:fso:{index}"
+                    if inside((L_GAME_COLS["win"] - 8, ry + 4, 60, 36)):
+                        return f"game:win:{index}"
                     if inside((L_GAME_COLS["del"] - 4, ry + 6, 36, 32)):
                         return f"game:del:{index}"
-                    if inside((L_GAME_COLS["name"] - 6, ry + 2, 362, L_GAME_ROW_H - 4)) \
+                    if inside((L_GAME_COLS["name"] - 6, ry + 2, L_GAME_NAME_W + 12, L_GAME_ROW_H - 4)) \
                             and self._last_session(self.games[index]["path"]):
                         return f"game:report:{index}"
                 if inside(L_GAME_AUTO):
@@ -8247,6 +8658,15 @@ class OptimizerApp(ctk.CTk):
             if inside(L_LOOK_INTRO):
                 return "look:intro"
         else:
+            x, y, w, h = L_SEGMENTS["set"]
+            if inside((x, y, w, h)):
+                index = min(len(SETTING_PAGES) - 1, max(0, int((lx - x) / (w / len(SETTING_PAGES)))))
+                return f"seg:set:{SETTING_PAGES[index][0]}"
+            if self.settings_page == "windows":
+                for key, rect in L_WINSET_ROWS.items():
+                    if inside(rect):
+                        return f"set:{key}"
+                return None
             for key, rect in L_SETTING_BUTTONS.items():
                 if inside(rect):
                     return f"btn:{key}"
@@ -8368,6 +8788,9 @@ class OptimizerApp(ctk.CTk):
     def _choose_segment(self, seg: str, key: str) -> None:
         if seg == "tool":
             self._switch_tool_page(key)
+            return
+        if seg == "set":
+            self._switch_settings_page(key)
             return
         if seg == "motion":
             if self.look["motion"] == key:
@@ -8675,6 +9098,19 @@ class OptimizerApp(ctk.CTk):
             self._hide_overlay()
             return
         self.after(16, self._fade_step)
+
+    def _switch_settings_page(self, page: str) -> None:
+        if page == self.settings_page or page not in dict(SETTING_PAGES):
+            return
+
+        def change() -> None:
+            self.settings_page = page
+            self._apply_visibility()
+            self.canvas.configure(cursor="hand2" if self._enabled(self.hover) else "")
+            self._render()
+
+        self._transition(change)
+        self._kick()
 
     def _switch_tool_page(self, page: str) -> None:
         if page == self.tool_page or page not in dict(TOOL_PAGES):
@@ -9048,6 +9484,9 @@ class OptimizerApp(ctk.CTk):
                     self._emit("ok", f"Slowed background apps while you play: {shown}")
                 elif kind == "background-restored":
                     self._emit("info", "Background apps are back to normal")
+                elif kind == "winkey-failed":
+                    self._emit("warn", "Couldn't block the Windows key: its helper didn't start or Windows "
+                                       "refused its keyboard hook")
                 elif kind in ("clean-scan", "clean-done"):
                     self._on_clean_event(kind, event[1])
                 elif kind == "games-found":
@@ -9620,6 +10059,38 @@ class OptimizerApp(ctk.CTk):
             on = not self._setting("preview")
             self._set_setting("preview", on)
             self._emit("ok", "Modes now show a preview and a summary" if on else "Modes now run without a preview")
+        elif key == "mouse":
+            current = mouse_accel_get()
+            if current is None:
+                self._emit("fail", "Windows wouldn't say how mouse acceleration is set")
+            elif current[2]:
+                self.state_store.set("mouse_saved", list(current))  # what to put back
+                if mouse_accel_set((0, 0, 0)):
+                    self._emit("ok", "Mouse acceleration off: the pointer moves the same distance at any speed")
+                else:
+                    self._emit("fail", "Windows didn't accept the mouse setting")
+            else:
+                saved = self.state_store.get("mouse_saved")
+                values = tuple(saved) if isinstance(saved, list) and len(saved) == 3 and saved[2] \
+                    else MOUSE_ACCEL_DEFAULT
+                if mouse_accel_set(values):
+                    self.state_store.set("mouse_saved", None)
+                    self._emit("ok", "Mouse acceleration is back on (Enhance pointer precision)")
+                else:
+                    self._emit("fail", "Windows didn't accept the mouse setting")
+        elif key == "startkey":
+            on = not self._setting("startkey")
+            self._set_setting("startkey", on)
+            if self.game_watcher is not None:
+                self.game_watcher.winkey_enabled = on
+            if on:
+                marked = sum(1 for g in self.games if g.get("winkey"))
+                where = f"the {marked} marked game{'s' if marked != 1 else ''}" if marked else "your games"
+                self._emit("ok", f"A lone Windows key press won't open Start in {where}; shortcuts like Win+D "
+                                 "still work")
+            else:
+                self._emit("ok", "The Windows key opens Start as usual again, games included")
+            self._refresh_startkey_row()
         elif key == "updates":
             on = not self._setting("updates")
             self._set_setting("updates", on)
@@ -9964,7 +10435,9 @@ class OptimizerApp(ctk.CTk):
         self._schedule_update_check(5000 if merged.get("updates") else None)
         if self.game_watcher is not None:
             self.game_watcher.slow_background = bool(merged.get("slow_background"))
+            self.game_watcher.winkey_enabled = bool(merged.get("startkey"))
         self.host_value = merged.get("custom_host") or ""
+        self._refresh_startkey_row()
         self.host_cursor = len(self.host_value)
         for row in self.ping_rows:
             if row["key"] == "custom":
@@ -9999,11 +10472,14 @@ class OptimizerApp(ctk.CTk):
         if self.game_watcher is None:
             self.game_watcher = GameWatcher(self.events)
             self.game_watcher.slow_background = bool(self._setting("slow_background"))
+            self.game_watcher.winkey_enabled = bool(self._setting("startkey"))
             self.game_watcher.set_games(self.games)
             self.game_watcher.start()
 
     def _save_games(self) -> None:
         self._set_setting("games", [{k: v for k, v in g.items() if not k.startswith("_")} for g in self.games])
+        if getattr(self, "t_setting_desc", None):
+            self._refresh_startkey_row()  # its text counts the marked games
         if self.game_watcher is not None:
             self.game_watcher.set_games(self.games)
         else:
@@ -10092,6 +10568,18 @@ class OptimizerApp(ctk.CTk):
                     if error:
                         self._emit("warn", f"{name}: priority not changed - {error}")
             self._emit("ok", f"{name}: high priority {'on' if game['priority'] else 'off'}")
+        elif what == "win":
+            game["winkey"] = not game.get("winkey")
+            self._save_games()
+            if not self._setting("startkey"):
+                self._emit("info", f"{name}: {'marked' if game['winkey'] else 'unmarked'}. It takes effect once "
+                                   "Settings > Windows > Block the Start menu key in games is on")
+            elif game["winkey"]:
+                self._emit("ok", f"{name}: a lone Windows key press won't open Start while it's in front")
+            elif any(g.get("winkey") for g in self.games):
+                self._emit("ok", f"{name}: the Windows key opens Start as usual again")
+            else:
+                self._emit("ok", "No games marked, so a lone Windows key press is blocked in every game again")
         elif what == "fso":
             want = not fso_disabled(path)
             try:
@@ -10504,7 +10992,7 @@ class OptimizerApp(ctk.CTk):
             counts.append(f"{benches} BENCHMARK{'S' if benches != 1 else ''}")
         c.itemconfigure(self.t_game_heads["name"], text=self._fit(f"{name.upper()}  ·  {'  ·  '.join(counts)}",
                                                                   self.f_label, 280))
-        for col in ("prio", "fso"):
+        for col in GAME_HEADS:
             c.itemconfigure(self.t_game_heads[col], text="")
         for col, label in (("fps", "FPS · 1% LOW"), ("cpu", "CPU"), ("gpu", "GPU"), ("temp", "HOTTEST"),
                            ("ping", "PING")):
@@ -10589,7 +11077,7 @@ class OptimizerApp(ctk.CTk):
         c.itemconfigure(self.t_buttons["findgames"], text="Back")
         c.itemconfigure(self.t_buttons["addgame"], text="")
         c.itemconfigure(self.t_game_heads["name"], text="COMPARING")
-        for col in ("prio", "fso", *L_HIST_COLS):
+        for col in (*GAME_HEADS, *L_HIST_COLS):
             c.itemconfigure(self.t_game_heads[col], text="")
 
         def when(r: dict) -> str:
@@ -10707,8 +11195,9 @@ class OptimizerApp(ctk.CTk):
             c.itemconfigure(self.t_buttons["addgame"],
                             text=f"Add {picked} game{'s' if picked != 1 else ''}" if items else "Add games")
             c.itemconfigure(self.t_game_heads["name"], text=f"FOUND ON THIS PC ({len(items)})")
-            c.itemconfigure(self.t_game_heads["prio"], text="ADD")
+            c.itemconfigure(self.t_game_heads["prio"], text="")
             c.itemconfigure(self.t_game_heads["fso"], text="")
+            c.itemconfigure(self.t_game_heads["win"], text="ADD")
             for i, row in enumerate(self.t_games):
                 index = self.game_offset + i
                 if index >= len(items):
@@ -10730,8 +11219,8 @@ class OptimizerApp(ctk.CTk):
             return
         c.itemconfigure(self.t_buttons["addgame"], text="Add game…")
         c.itemconfigure(self.t_game_heads["name"], text="GAME")
-        c.itemconfigure(self.t_game_heads["prio"], text="HIGH PRIORITY")
-        c.itemconfigure(self.t_game_heads["fso"], text="FULLSCREEN OPT. OFF")
+        for col, label in GAME_HEADS.items():
+            c.itemconfigure(self.t_game_heads[col], text=label)
         running = set(self._running_games().values())
         for i, items in enumerate(self.t_games):
             index = self.game_offset + i
@@ -10741,7 +11230,7 @@ class OptimizerApp(ctk.CTk):
                 continue
             game = self.games[index]
             game["_fso"] = fso_disabled(game["path"])
-            c.itemconfigure(items["name"], text=self._fit(game.get("name") or game["path"], self.f_desc, 350))
+            c.itemconfigure(items["name"], text=self._fit(game.get("name") or game["path"], self.f_desc, L_GAME_NAME_W))
             if os.path.normcase(game["path"]) in running:
                 sub = "Running now" + (" \u00b7 high priority" if game.get("priority", True) else "")
                 c.itemconfigure(items["sub"], text=sub, fill=TEXT_HI)
@@ -10751,9 +11240,9 @@ class OptimizerApp(ctk.CTk):
                 count = len(self._game_sessions(game["path"]))
                 sub = (f"Last played {format_day(last['end'])} for {format_duration(last['end'] - last['start'])}"
                        f"  ·  {'View report' if count == 1 else f'{count} sessions'}")
-                c.itemconfigure(items["sub"], text=self._fit(sub, self.f_label, 350), fill=SILVER)
+                c.itemconfigure(items["sub"], text=self._fit(sub, self.f_label, L_GAME_NAME_W), fill=SILVER)
             else:
-                c.itemconfigure(items["sub"], text=self._fit(game["path"], self.f_label, 350), fill=TEXT_MID)
+                c.itemconfigure(items["sub"], text=self._fit(game["path"], self.f_label, L_GAME_NAME_W), fill=TEXT_MID)
         c.itemconfigure(self.t_games_empty, text="" if self.games else
                         "No games yet. Press Add game… and pick the game's .exe file.\n"
                         "It gets high CPU priority every time it runs.")
