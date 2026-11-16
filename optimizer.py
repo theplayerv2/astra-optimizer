@@ -56,8 +56,8 @@ except Exception:  # pragma: no cover - depends on the build
 
 APP_NAME = "Astra Optimizer"
 LEGACY_APP_NAME = "Optimizer"  # pre-1.12 name: data folder and startup task are carried over
-APP_VERSION = "1.7.2"
-DISPLAY_VERSION = "v1.7.2"
+APP_VERSION = "1.7.3"
+DISPLAY_VERSION = "v1.7.3"
 CREDIT_NAME = "theplayerv2"
 UPDATE_REPO = "theplayerv2/astra-optimizer"
 CREDIT_URL = f"https://github.com/{UPDATE_REPO}"
@@ -6122,6 +6122,9 @@ class OptimizerApp(ctk.CTk):
     def __init__(self, admin: bool, state_store: StateStore | None = None, start_hidden: bool = False,
                  background_services: bool = True, instance_event=None):
         ctk.set_appearance_mode("dark")
+        # customtkinter re-checks the Windows light/dark theme every 30 ms, even though Astra is always
+        # dark; that timer alone was about half the app's idle CPU. Once a minute is plenty.
+        ctk.AppearanceModeTracker.update_loop_interval = 60_000
         super().__init__(fg_color=VOID)
         self.admin = admin
         self.state_store = state_store or StateStore()

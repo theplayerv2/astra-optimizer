@@ -4,6 +4,15 @@ What changed in each version of Astra Optimizer. The newest version is at the to
 
 When a version is tagged on GitHub (for example `v1.2.0`), its section below becomes the release notes.
 
+## v1.7.3 - 2026-11-16
+
+### Improved
+- **Lighter on your PC:** Astra uses about half the CPU it did while idle or in-game (roughly 1–1.5% of one core
+  sitting idle and 1.6% with the FPS overlay showing, down from 2–3%). The UI library it's built on was re-checking
+  the Windows light/dark theme 33 times a second, even though Astra is always dark.
+- **Smaller download:** the exe is about a fifth smaller, so it also unpacks faster each time it starts. It no longer
+  carries support for AVIF images, which Astra never uses.
+
 ## v1.7.2 - 2026-11-16
 
 ### Added

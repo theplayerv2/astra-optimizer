@@ -86,6 +86,7 @@ echo [INFO] Building "Astra Optimizer.exe" with PyInstaller...
     --add-data "%PROJECT_DIR%assets;assets" ^
     --collect-all customtkinter ^
     --hidden-import pystray._win32 ^
+    --exclude-module PIL._avif ^
     --distpath "%DIST_DIR%" ^
     --workpath "%WORK_DIR%" ^
     --specpath "%WORK_DIR%" ^
