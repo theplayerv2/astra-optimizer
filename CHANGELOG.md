@@ -4,6 +4,14 @@ What changed in each version of Astra Optimizer. The newest version is at the to
 
 When a version is tagged on GitHub (for example `v1.2.0`), its section below becomes the release notes.
 
+## v1.7.2 - 2026-11-16
+
+### Added
+- **Startup intro:** when Astra opens, its star lights up on the starfield, the orbit is traced around it and the name
+  appears, then both glide into the title bar as the app fades in. It takes about two seconds; click or press any key
+  to skip it. With Motion on Reduced it's a short fade, and with Motion Off it doesn't play. Appearance > Motion >
+  **Startup intro** turns it off. It never plays when Astra starts in the tray at sign-in.
+
 ## v1.7.1 - 2026-11-16
 
 ### Added

@@ -56,8 +56,8 @@ except Exception:  # pragma: no cover - depends on the build
 
 APP_NAME = "Astra Optimizer"
 LEGACY_APP_NAME = "Optimizer"  # pre-1.12 name: data folder and startup task are carried over
-APP_VERSION = "1.7.1"
-DISPLAY_VERSION = "v1.7.1"
+APP_VERSION = "1.7.2"
+DISPLAY_VERSION = "v1.7.2"
 CREDIT_NAME = "theplayerv2"
 UPDATE_REPO = "theplayerv2/astra-optimizer"
 CREDIT_URL = f"https://github.com/{UPDATE_REPO}"
@@ -499,6 +499,10 @@ SW_HIDE = 0
 SWP_NOACTIVATE = 0x0010
 SWP_SHOWWINDOW = 0x0040
 PW_RENDERFULLCONTENT = 0x00000002
+GWLP_HWNDPARENT = -8  # a top-level window's owner
+RDW_INVALIDATE, RDW_ALLCHILDREN, RDW_UPDATENOW, RDW_FRAME = 0x0001, 0x0080, 0x0100, 0x0400
+user32.RedrawWindow.argtypes = [wintypes.HWND, ctypes.c_void_p, ctypes.c_void_p, wintypes.UINT]
+user32.RedrawWindow.restype = wintypes.BOOL
 
 
 _icon_api = ctypes.WinDLL("user32")  # private function objects for the taskbar icon
@@ -4925,12 +4929,14 @@ L_PRIV_FOOT = (78, 416, 628, 46)
 L_PRIV_ALL = (78 + 628 - 16 - 120, 416 + 4, 120, 38)
 # Appearance tab
 L_LOOK_RESET = (586, 50, 120, 36)
-L_LOOK_ROWS = {"background": (78, 100, 628, 88), "adjust": (78, 198, 628, 168), "motion": (78, 376, 628, 90)}
-L_SEGMENTS = {"bg": (386, 112, 300, 32), "motion": (326, 390, 360, 32), "tool": (78, 50, 424, 34)}
+L_LOOK_ROWS = {"background": (78, 100, 628, 88), "adjust": (78, 198, 628, 136), "motion": (78, 344, 628, 122)}
+L_SEGMENTS = {"bg": (386, 112, 300, 32), "motion": (326, 358, 360, 32), "tool": (78, 50, 424, 34)}
 L_LOOK_IMAGE_BTN = (98, 146, 140, 30)
 L_LOOK_HINT_Y = 161
-L_SLIDERS = {"blur": (228, 224, 370), "dim": (228, 262, 370), "glass": (228, 300, 370),
-             "stand_out": (228, 338, 370)}  # x, centre y, width
+L_SLIDERS = {"blur": (228, 222, 370), "dim": (228, 251, 370), "glass": (228, 280, 370),
+             "stand_out": (228, 309, 370)}  # x, centre y, width
+L_LOOK_INTRO = (78, 428, 628, 38)  # the "Startup intro" line at the foot of the Motion row
+L_LOOK_INTRO_Y = 446               # its centre line
 
 BG_KINDS = [("stars", "Starfield"), ("black", "Black"), ("image", "Image")]
 MOTION_MODES = [("system", "Windows"), ("full", "Full"), ("reduced", "Reduced"), ("off", "Off")]
@@ -4944,7 +4950,15 @@ DEFAULT_LOOK = {
     "glass": 60,
     "stand_out": 50,
     "motion": "system",
+    "intro": True,
 }
+# Startup intro (logical units). The mark lights up at the centre, its orbit is traced, the name
+# appears, then both fly into the title strip - landing exactly on the real glyph and name.
+INTRO_SECONDS = {"full": 1.95, "reduced": 0.95}
+INTRO_MARK = (360, 196, 132)   # centre x, centre y, size
+INTRO_WORD = (296, 30)         # wordmark centre y, font size
+INTRO_ORBIT_TILT = math.radians(24)
+INTRO_MOON_ANGLE = math.atan2(-8 / 15, 39 / 44)  # where the orbit's moon rests in the mark
 BG_HINTS = {
     "stars": "Drawn by Astra Optimizer, the same sky on every launch.",
     "black": "Plain black behind every panel.",
@@ -5452,6 +5466,89 @@ class GalaxyPainter:
         glyph = self._icon(kind, max(8, int(round(size * (0.80 if size >= 40 else 0.86)))), STARLIGHT)
         tile.alpha_composite(glyph, ((size - glyph.width) // 2, (size - glyph.height) // 2))
         return tile
+
+    # ---------------- startup intro ----------------
+
+    def intro_mark(self, size: int, arm: float, sweep: float) -> Image.Image:
+        """The Astra mark part-drawn, same geometry as the "astra" icon: arm = how far the star has
+        grown (0..1, may overshoot), sweep = how much of the orbit is traced (0..1, moon leading)."""
+        ss = 2
+        big = max(4, size * ss)
+        u = big / 100.0
+        im = Image.new("RGBA", (big, big), (0, 0, 0, 0))
+        d = ImageDraw.Draw(im)
+        cos_t, sin_t = math.cos(INTRO_ORBIT_TILT), math.sin(INTRO_ORBIT_TILT)
+
+        def at(theta: float) -> tuple[float, float]:
+            dx, dy = 44 * math.cos(theta), 15 * math.sin(theta)
+            return (50 + dx * cos_t - dy * sin_t) * u, (50 + dx * sin_t + dy * cos_t) * u
+
+        if sweep > 0:
+            start = INTRO_MOON_ANGLE - 2 * math.pi
+            steps = max(2, int(120 * sweep))
+            points = [at(start + 2 * math.pi * sweep * i / steps) for i in range(steps + 1)]
+            d.line(points, fill=rgba(SILVER, 215), width=max(1, int(round(4.5 * u))), joint="curve")
+            mx, my = points[-1]
+            d.ellipse((mx - 6 * u, my - 6 * u, mx + 6 * u, my + 6 * u), fill=rgba(STARLIGHT))
+        if arm > 0:
+            length, waist = 40 * arm, 8.5 * min(1.0, arm)
+            points = []
+            for k in range(8):
+                angle = math.pi / 4 * k - math.pi / 2
+                radius = length if k % 2 == 0 else waist
+                points.append(((50 + math.cos(angle) * radius) * u, (50 + math.sin(angle) * radius) * u))
+            d.polygon(points, fill=rgba(STARLIGHT))
+            core = 7 * min(1.0, arm * 1.4)
+            d.ellipse(((50 - core) * u, (50 - core) * u, (50 + core) * u, (50 + core) * u), fill=rgba("#FFFFFF"))
+        return im.resize((size, size), Image.Resampling.LANCZOS)
+
+    def intro_glow(self, size: int) -> Image.Image:
+        """Soft starlight bloom behind the mark (size = the mark's size; the bloom is twice that)."""
+        def make() -> Image.Image:
+            g = size * 2
+            mask = Image.new("L", (g, g), 0)
+            ImageDraw.Draw(mask).ellipse((g * 0.36, g * 0.36, g * 0.64, g * 0.64), fill=150)
+            mask = mask.filter(ImageFilter.GaussianBlur(g * 0.11))
+            layer = Image.new("RGBA", (g, g), rgba(STARLIGHT, 0))
+            layer.putalpha(mask)
+            return layer
+        return self._memo(("intro-glow", size), make)
+
+    def intro_spikes(self, reach: int) -> Image.Image:
+        """The long cross-shaped flare a star throws as it ignites, like the flared stars in the sky."""
+        def make() -> Image.Image:
+            g = reach * 2
+            c, w = reach, max(1.0, 1.4 * self.scale)
+            mask = Image.new("L", (g, g), 0)
+            d = ImageDraw.Draw(mask)
+            d.polygon([(0, c), (c, c - w), (g, c), (c, c + w)], fill=200)
+            d.polygon([(c, 0), (c - w, c), (c, g), (c + w, c)], fill=200)
+            halo = mask.filter(ImageFilter.GaussianBlur(max(1.0, 2.2 * self.scale)))
+            mask = ImageChops.add(mask, halo)
+            layer = Image.new("RGBA", (g, g), rgba(STARLIGHT, 0))
+            layer.putalpha(mask)
+            return layer
+        return self._memo(("intro-spikes", reach), make)
+
+    def intro_word(self, text: str, size: int, tracking: float) -> Image.Image:
+        """The wordmark set glyph by glyph so its letter-spacing can close up as it appears.
+        tracking is extra space per letter as a fraction of the font size. The image is one line
+        box tall (ascent + descent), like a Tk text item, so it can be centred the same way."""
+        font = _overlay_font(size, b"SemiBold")
+        try:
+            ascent, descent = font.getmetrics()
+        except Exception:
+            ascent, descent = size, size // 4
+        gap = tracking * size
+        advances = [font.getlength(ch) for ch in text]
+        width = int(math.ceil(sum(advances) + gap * (len(text) - 1))) + 2
+        im = Image.new("RGBA", (max(1, width), ascent + descent), (0, 0, 0, 0))
+        d = ImageDraw.Draw(im)
+        x = 1.0
+        for ch, advance in zip(text, advances):
+            d.text((x, 0), ch, font=font, fill=rgba(TEXT_HI))
+            x += advance + gap
+        return im
 
     def avatar(self, size: int, path: str) -> Image.Image:
         """Round avatar with a fine light ring; a lettered disc if the picture is missing."""
@@ -6207,6 +6304,10 @@ class OptimizerApp(ctk.CTk):
         self._apply_visibility()
         self._render()
         self._set_window_icon()
+        self.intro: dict | None = None
+        self._intro_pending = self._intro_wanted()
+        if self._intro_pending:
+            self.attributes("-alpha", 0.0)  # stay invisible until the intro covers the window
         self.after(10, self._apply_borderless)
 
         self.telemetry = TelemetryThread(self.events)
@@ -6278,6 +6379,221 @@ class OptimizerApp(ctk.CTk):
         self.lift()
         self.focus_force()
         self._ensure_window_size()
+        if self._intro_pending:
+            self._intro_pending = False
+            self.after(0, self._start_intro)
+
+    # ---------------- startup intro ----------------
+
+    def _intro_wanted(self) -> bool:
+        return bool(self.look.get("intro", True)) and not self._start_hidden and self._motion_level() != "off"
+
+    def _start_intro(self) -> None:
+        """Cover the window with a borderless twin and play the intro on it. The real UI is ready
+        underneath; the last frames crossfade into a snapshot of it, so the handoff is invisible."""
+        px = self.px
+        try:
+            self.update_idletasks()
+            if not self._can_fade():
+                raise RuntimeError("window not showing")
+            level = self._motion_level()
+            if level == "off":
+                raise RuntimeError("motion is off")
+            size = (px(WINDOW_W), px(WINDOW_H))
+            win = tk.Toplevel(self)
+            win.overrideredirect(True)
+            win.configure(bg=VOID, cursor="")
+            label = tk.Label(win, bd=0, highlightthickness=0, bg=VOID)
+            label.place(x=0, y=0)
+            sky = self._background_layer()
+            if sky.size != size:
+                sky = sky.resize(size, Image.Resampling.LANCZOS)
+            black = Image.new("RGBA", size, rgba(VOID))
+            photo = ImageTk.PhotoImage(black.convert("RGB"))
+            label.configure(image=photo)
+            win.update_idletasks()
+            hwnd = int(win.wm_frame(), 16)
+            ex = user32.GetWindowLongPtrW(hwnd, GWL_EXSTYLE)
+            user32.SetWindowLongPtrW(hwnd, GWL_EXSTYLE, ex | WS_EX_TOOLWINDOW)
+            user32.SetWindowLongPtrW(hwnd, GWLP_HWNDPARENT, self._hwnd())  # owned: stays above, hides with it
+            user32.SetWindowPos(hwnd, None, self.winfo_rootx(), self.winfo_rooty(), size[0], size[1],
+                                SWP_SHOWWINDOW)
+            if dwmapi is not None:
+                corner = ctypes.c_int(DWMWCP_ROUND)
+                dwmapi.DwmSetWindowAttribute(hwnd, DWMWA_WINDOW_CORNER_PREFERENCE, ctypes.byref(corner), 4)
+            label.update()
+            for sequence in ("<ButtonPress>", "<KeyPress>"):
+                win.bind(sequence, lambda _e: self._skip_intro())
+            win.focus_force()
+            mark = INTRO_MARK[2]
+            self.intro = {
+                "win": win, "label": label, "hwnd": hwnd, "photo": photo, "level": level,
+                "start": time.monotonic(), "length": INTRO_SECONDS[level], "sky": sky, "black": black,
+                "snapshot": None, "word": {}, "leaving": None,
+                "glow": self.painter.intro_glow(px(mark)), "spikes": self.painter.intro_spikes(px(170)),
+            }
+        except Exception as exc:
+            self._end_intro()
+            if str(exc) not in ("window not showing", "motion is off"):
+                self._write_log_file("WARN", f"Startup intro skipped: {exc!r}")
+            return
+        self.attributes("-alpha", 1.0)  # the intro covers it now
+        self._intro_step()
+
+    def _intro_frame(self, t: float) -> Image.Image:
+        """One frame of the intro at t seconds."""
+        intro, px, painter = self.intro, self.px, self.painter
+        full = intro["level"] == "full"
+        cx, cy, mark = INTRO_MARK
+        word_y, word_size = INTRO_WORD
+        gx, gy, gs = L_BRAND_GLYPH
+
+        def span(a: float, b: float) -> float:
+            return 0.0 if t <= a else 1.0 if t >= b else (t - a) / (b - a)
+
+        def ease_out(v: float) -> float:
+            return 1 - (1 - v) ** 3
+
+        def ease_in_out(v: float) -> float:
+            return 4 * v ** 3 if v < 0.5 else 1 - (-2 * v + 2) ** 3 / 2
+
+        def faded(img: Image.Image, alpha: float) -> Image.Image:
+            if alpha >= 0.999:
+                return img
+            img = img.copy()
+            img.putalpha(img.getchannel("A").point(lambda v: int(v * alpha)))
+            return img
+
+        if full:
+            dawn = ease_out(span(0.0, 0.32))
+            arm_t = span(0.10, 0.62)
+            arm = 1 + 2.4 * (arm_t - 1) ** 3 + 1.4 * (arm_t - 1) ** 2 if arm_t > 0 else 0.0  # ease-out-back
+            sweep = ease_in_out(span(0.38, 1.08))
+            word_in = ease_out(span(0.78, 1.28))
+            fly = ease_in_out(span(1.40, 1.80))
+            reveal = ease_in_out(span(1.42, 1.78))
+            vanish = span(1.66, 1.84)  # gone before the end, so nothing shows double over the real UI
+            spike = ease_out(span(0.10, 0.50)) * (1 - span(0.42, 0.98))
+            glow = (ease_out(span(0.10, 0.45)) * (1 - 0.55 * span(0.45, 1.0))) * (1 - span(1.42, 1.66))
+        else:  # reduced: no movement, the finished mark simply fades in and hands over
+            dawn = word_in = ease_out(span(0.0, 0.30))
+            arm, sweep = 1.0, 1.0
+            fly, vanish, spike = 0.0, 0.0, 0.0
+            reveal = ease_in_out(span(0.55, 0.95))
+            glow = 0.45 * dawn * (1 - reveal)
+
+        frame = intro["sky"] if dawn >= 1 else Image.blend(intro["black"], intro["sky"], dawn)
+        if reveal > 0 and intro["snapshot"] is not None:
+            frame = Image.blend(frame, intro["snapshot"], reveal)
+        elif frame is intro["sky"]:
+            frame = frame.copy()
+        keep = 1.0 - vanish if full else (1.0 - reveal) * dawn  # how visible the drawn pieces are
+
+        # Mark: from the centre into the title-strip glyph.
+        mx = cx + (gx + gs / 2 - cx) * fly
+        my = cy + (gy + gs / 2 - cy) * fly
+        msize = mark + (gs - mark) * fly
+        if spike > 0.01:
+            img = intro["spikes"]
+            reach = max(2, int(img.width * (0.35 + 0.65 * spike)))
+            img = faded(img.resize((reach, reach), Image.Resampling.BILINEAR), spike * keep)
+            paste_layer(frame, img, px(mx) - reach // 2, px(my) - reach // 2)
+        if glow > 0.01:
+            img = intro["glow"]
+            g = max(2, int(img.width * msize / mark))
+            img = faded(img if g == img.width else img.resize((g, g), Image.Resampling.BILINEAR), glow * keep)
+            paste_layer(frame, img, px(mx) - g // 2, px(my) - g // 2)
+        if keep > 0.01 and (arm > 0 or sweep > 0):
+            s = max(4, px(msize))
+            img = faded(painter.intro_mark(s, arm, sweep), keep)
+            paste_layer(frame, img, px(mx) - s // 2, px(my) - s // 2)
+
+        # Wordmark: letter-spacing closes as it appears, then it shrinks onto the title text.
+        if word_in > 0.01 and keep > 0.01:
+            tracking = round(0.42 * (1 - word_in), 3)
+            cache = intro["word"]
+            img = cache.get(tracking)
+            if img is None:
+                if len(cache) > 80:
+                    cache.clear()
+                img = cache[tracking] = painter.intro_word(APP_NAME, px(word_size), tracking)
+            if "word_end" not in intro:  # scale that makes it exactly as wide as the title-strip name
+                plain = cache.get(0.0) or painter.intro_word(APP_NAME, px(word_size), 0.0)
+                intro["word_end"] = self.f_brand.measure(APP_NAME) / max(1, plain.width - 2)
+            k = 1 + (intro["word_end"] - 1) * fly
+            if k < 0.999:
+                img = img.resize((max(1, int(img.width * k)), max(1, int(img.height * k))), Image.Resampling.LANCZOS)
+            left0 = (WINDOW_W - img.width / self.scale / k) / 2  # centred at full size
+            left = left0 + (42 - left0) * fly
+            centre = word_y + (18 - word_y) * fly
+            img = faded(img, word_in * keep)
+            paste_layer(frame, img, px(left) - 1, px(centre) - img.height // 2)
+        return frame
+
+    def _intro_step(self) -> None:
+        intro = self.intro
+        if intro is None:
+            return
+        if self._closing:
+            self._end_intro()
+            return
+        try:
+            t = time.monotonic() - intro["start"]
+            leaving = intro["leaving"]
+            if leaving is not None:  # skipped: fade the cover away quickly
+                k = (time.monotonic() - leaving) / 0.16
+                if k >= 1:
+                    self._end_intro()
+                    return
+                intro["win"].attributes("-alpha", (1 - k) ** 1.6)
+                self.after(16, self._intro_step)
+                return
+            handoff = 1.42 if intro["level"] == "full" else 0.55
+            if intro["snapshot"] is None and t >= handoff - 0.05:
+                snap = capture_window(self._hwnd())
+                if snap is None or snap.size != intro["sky"].size:
+                    intro["snapshot"] = False  # can't see the UI: fade the cover instead
+                else:
+                    intro["snapshot"] = snap.convert("RGBA")
+            if t >= intro["length"]:
+                self._end_intro()
+                return
+            if intro["snapshot"] is False and t >= handoff:
+                intro["leaving"] = time.monotonic()
+                self.after(16, self._intro_step)
+                return
+            frame = self._intro_frame(t)
+            intro["photo"].paste(frame.convert("RGB"))
+            self.after(12, self._intro_step)
+        except Exception as exc:
+            self._write_log_file("WARN", f"Startup intro skipped: {exc!r}")
+            self._end_intro()
+
+    def _skip_intro(self) -> None:
+        if self.intro is not None and self.intro["leaving"] is None:
+            self.intro["leaving"] = time.monotonic()
+
+    def _end_intro(self) -> None:
+        intro, self.intro = self.intro, None
+        try:
+            self.attributes("-alpha", 1.0)
+            hwnd = self._hwnd()
+            ex = user32.GetWindowLongPtrW(hwnd, GWL_EXSTYLE)
+            if ex & WS_EX_LAYERED:  # Tk leaves the window layered after an alpha change
+                user32.SetWindowLongPtrW(hwnd, GWL_EXSTYLE, ex & ~WS_EX_LAYERED)
+                user32.RedrawWindow(hwnd, None, None, RDW_INVALIDATE | RDW_ALLCHILDREN | RDW_FRAME | RDW_UPDATENOW)
+        except Exception:
+            pass
+        if intro is not None:
+            try:
+                intro["win"].destroy()
+            except tk.TclError:
+                pass
+            if not self._closing:
+                try:
+                    self.focus_force()
+                except tk.TclError:
+                    pass
 
     def _minimize(self) -> None:
         # Tk refuses iconify() on frameless windows, so ask Windows directly.
@@ -6428,6 +6744,8 @@ class OptimizerApp(ctk.CTk):
         rows(privacy, [*L_PRIV_ROWS.values(), L_PRIV_FOOT])
         appearance = base.copy()
         rows(appearance, L_LOOK_ROWS.values())
+        ix, iy, iw, _ih = L_LOOK_INTRO
+        self._hairline(appearance, ix + 20, iy, iw - 40, 1 / self.scale, 16)
         rows(games, [L_GAME_AUTO])
         cleanup = base.copy()
         rows(cleanup, [*L_CLEAN_ROWS.values(), L_CLEAN_BAR])
@@ -6533,6 +6851,8 @@ class OptimizerApp(ctk.CTk):
             for key in ("background", "bg_name", "glass", "stand_out", "motion"):
                 if key in saved:
                     look[key] = saved[key]
+            if isinstance(saved.get("intro"), bool):
+                look["intro"] = saved["intro"]
             if "stand_out" not in saved and saved.get("glass") == 100:
                 look["glass"] = DEFAULT_LOOK["glass"]  # pre-1.8 solid panels -> the new glass default
             for kind, values in (saved.get("adjust") or {}).items():
@@ -6827,8 +7147,12 @@ class OptimizerApp(ctk.CTk):
                                                 font=self.f_ghost_small, fill=TEXT_HI, tags=(*look, "look-image"))
         x, y, _, _ = L_LOOK_ROWS["motion"]
         c.create_text(px(x + 20), px(y + 20), anchor="nw", text="Motion", font=self.f_title, fill=TEXT_HI, tags=look)
-        self.t_motion_desc = c.create_text(px(x + 20), px(y + 60), anchor="nw", font=self.f_desc, fill=TEXT_MID,
+        self.t_motion_desc = c.create_text(px(x + 20), px(y + 54), anchor="nw", font=self.f_desc, fill=TEXT_MID,
                                            width=px(588), tags=look)
+        c.create_text(px(x + 20), px(L_LOOK_INTRO_Y), anchor="w", text="Startup intro", font=self.f_desc,
+                      fill=TEXT_HI, tags=look)
+        self.t_intro_hint = c.create_text(px(x + 20) + self.f_desc.measure("Startup intro") + px(12),
+                                          px(L_LOOK_INTRO_Y), anchor="w", font=self.f_desc, fill=TEXT_MID, tags=look)
         for seg, options in (("bg", BG_KINDS), ("motion", MOTION_MODES)):
             sx, sy, sw, sh = L_SEGMENTS[seg]
             step = sw / len(options)
@@ -7229,6 +7553,8 @@ class OptimizerApp(ctk.CTk):
             return True
         if kind == "card":
             return self.tab == "boost" and not self.busy
+        if kind == "look":
+            return self.tab == "appearance"
         if kind == "set":
             if self.tab != "settings":
                 return False
@@ -7654,6 +7980,13 @@ class OptimizerApp(ctk.CTk):
             self._render_segment(scene, seg, options)
         for key in L_SLIDERS:
             self._paint_slider(key)
+        px = self.px
+        tw, th = L_TOGGLE
+        x, _y, w, _h = L_LOOK_INTRO
+        state = "hover" if self.hover == "look:intro" else "normal"
+        on = bool(self.look.get("intro", True))
+        img = self._cached(("toggle", on, state), lambda: self.painter.toggle(px(tw), px(th), on, state))
+        paste_layer(scene, img, px(x + w - 20 - tw), px(L_LOOK_INTRO_Y - th / 2))
 
     def _paint_slider(self, key: str) -> None:
         """Redraw one slider's own small layer - cheap enough for every mouse move."""
@@ -7708,6 +8041,15 @@ class OptimizerApp(ctk.CTk):
         else:
             desc = MOTION_TEXT[mode]
         c.itemconfigure(self.t_motion_desc, text=desc)
+        if not self.look.get("intro", True):
+            hint = "Off. Astra opens straight to the app."
+        elif self._motion_level() == "off":
+            hint = "Skipped while Motion is Off."
+        elif self._motion_level() == "reduced":
+            hint = "A short fade when Astra opens. Click to skip."
+        else:
+            hint = "Plays when Astra opens. Click or press a key to skip."
+        c.itemconfigure(self.t_intro_hint, text=hint)
 
     def _render_boost(self, scene: Image.Image) -> None:
         px = self.px
@@ -7886,6 +8228,8 @@ class OptimizerApp(ctk.CTk):
             for key, (x, cy, w) in L_SLIDERS.items():
                 if inside((x - 12, cy - 14, w + 24, 28)):
                     return f"slider:{key}"
+            if inside(L_LOOK_INTRO):
+                return "look:intro"
         else:
             for key, rect in L_SETTING_BUTTONS.items():
                 if inside(rect):
@@ -8030,6 +8374,13 @@ class OptimizerApp(ctk.CTk):
         self._apply_look(fade=True)
         self._kick()
 
+    def _toggle_intro(self) -> None:
+        self.look["intro"] = not self.look.get("intro", True)
+        self._save_look()
+        self._refresh_look_texts()
+        self._emit("ok", "Startup intro turned " + ("on" if self.look["intro"] else "off"))
+        self._render()
+
     def _reset_look(self) -> None:
         name = self.look.get("bg_name", "")
         self.look = json.loads(json.dumps(DEFAULT_LOOK))
@@ -8048,6 +8399,8 @@ class OptimizerApp(ctk.CTk):
             self._choose_segment(seg, option)
         elif target == "btn:reset":
             self._reset_look()
+        elif target == "look:intro":
+            self._toggle_intro()
         elif target == "btn:image":
             if self._pick_background():
                 self._save_look()
